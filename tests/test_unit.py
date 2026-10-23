@@ -528,3 +528,55 @@ def test_replayed_start_is_not_handled_again_live():
     assert bridge._last_ws_ts == 12000
     bridge._on_text(json.dumps({"event": "SYNTH_START", "args": "gene|v|next", "timestamp": 13000}))
     assert spawned == [1] and list(bridge._live_starts) == [("gene|v|next", 13000.0)]
+
+
+# ----- prebuffer at the start of an utterance -----
+
+def test_prebuffer_holds_until_enough():
+    chunks = [b"a" * 100, b"b" * 100, b"c" * 100, b"d" * 50]
+    out = list(sb.prebuffer(chunks, 250))
+    assert out == [b"a" * 100 + b"b" * 100 + b"c" * 100, b"d" * 50]
+
+
+def test_prebuffer_short_stream_is_one_block():
+    assert list(sb.prebuffer([b"ab", b"cd"], 1000)) == [b"abcd"]
+
+
+def test_prebuffer_disabled_and_empty():
+    assert list(sb.prebuffer([b"ab", b"cd"], 0)) == [b"ab", b"cd"]
+    assert list(sb.prebuffer([], 100)) == []
+
+
+def test_prebuffer_is_lazy_after_the_head():
+    pulled = []
+
+    def source():
+        for c in (b"x" * 10, b"y" * 10, b"z" * 10):
+            pulled.append(c[:1])
+            yield c
+
+    gen = sb.prebuffer(source(), 15)
+    assert next(gen) == b"x" * 10 + b"y" * 10
+    assert pulled == [b"x", b"y"]                 # nothing read beyond the head yet
+
+
+def test_prebuffered_head_goes_out_first_in_bounded_frames():
+    tts = sb.ToneTts(types.SimpleNamespace())
+    hold = 24000 * 300 // 1000 * 2
+    out = list(sb.rechunk(sb.prebuffer(tts.synthesize("a" * 30, "v"), hold)))
+    assert all(0 < len(c) <= sb.MAX_CHUNK_BYTES and len(c) % 2 == 0 for c in out)
+    assert b"".join(out) == b"".join(tts.synthesize("a" * 30, "v"))
+    assert len(out[0]) == sb.MAX_CHUNK_BYTES                      # head split into full frames
+
+
+def test_utterance_records_prebuffer(monkeypatch):
+    async def flow(bridge):
+        bridge.args.prebuffer_ms = 300
+        monkeypatch.setattr(sb, "fallback_deadline", lambda f, l, s, r, margin=0: l + 0.05)
+        await bridge._on_synth_start("gene", "x", "a" * 30)      # 1.8 s tone
+        u = bridge.current
+        await asyncio.wait_for(u.task, 5)
+        assert u.prebuffered == 24000 * 300 // 1000 * 2           # three 100 ms tone chunks
+
+    bridge, _ = asyncio.run(run_flow(flow))
+    assert [c[0] for c in bridge.ws.commands()] == ["SYNTH_EVENT_START", "SYNTH_EVENT_STOP"]

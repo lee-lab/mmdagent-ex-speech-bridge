@@ -88,6 +88,7 @@ uv run speech_bridge.py --tts tone --asr keyboard
 | `--lang ja\|en\|auto` | `ja` | Recognition language hint (`auto` = let the model detect it). Synthesis speaks whatever language the text is in. |
 | `--voice NAME` | `marin` | TTS voice used when the script's voice name is not one of the backend's voices |
 | `--instructions TEXT` | none | Tone-of-voice prompt for the TTS model, e.g. `"Speak cheerfully and a little fast."` |
+| `--prebuffer-ms MS` | `300` | Audio collected before an utterance starts playing, so playback does not run dry right after it starts (`0` = off; short utterances start when fully synthesized) |
 | `--tts-model NAME` | `gpt-4o-mini-tts` | OpenAI speech model |
 | `--asr-model NAME` | `gpt-4o-mini-transcribe` | OpenAI transcription model |
 | `--openai-key KEY` | env `OPENAI_API_KEY` | OpenAI API key |
@@ -182,6 +183,10 @@ Yield audio as soon as it is produced: scripts give up waiting for
   Windows Defender Firewall for private networks (the prompt appears on its
   first start), so that ports 48000 and 48001 are reachable. Nothing is needed
   when both run on the same PC.
+- **A dropout (or a short burst, then a gap) right after speech starts** — the
+  engine ran out of audio before the next streamed chunk arrived. Raise
+  `--prebuffer-ms` (e.g. `600`); this delays the start of speech by up to that
+  amount. WSL/WSLg audio also adds start-up jitter.
 - **"cannot create the audio_playback stream"** — the engine's machine has no
   audio output device, or four streams are already open (the engine's limit).
 - **"lip sync for 'x' is unavailable ... (409)"** — another playback stream

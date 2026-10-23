@@ -86,6 +86,7 @@ uv run speech_bridge.py --tts tone --asr keyboard
 | `--lang ja\|en\|auto` | `ja` | 認識の言語ヒント（`auto` = モデルが判定）。合成はテキストの言語でそのまま話します |
 | `--voice NAME` | `marin` | スクリプトの声の名前がバックエンドの声にないときに使う TTS の声 |
 | `--instructions TEXT` | なし | TTS モデルへの話し方の指示。例: `"明るく、少し早口で話してください。"` |
+| `--prebuffer-ms MS` | `300` | 発話の再生を始める前にためておく音声の長さ。再生開始直後に音が途切れるのを防ぎます（`0` = 無効。短い発話は合成が終わった時点で再生を始めます） |
 | `--tts-model NAME` | `gpt-4o-mini-tts` | OpenAI の音声合成モデル |
 | `--asr-model NAME` | `gpt-4o-mini-transcribe` | OpenAI の文字起こしモデル |
 | `--openai-key KEY` | 環境変数 `OPENAI_API_KEY` | OpenAI の API キー |
@@ -181,6 +182,10 @@ ASR_BACKENDS["myasr"] = MyAsr
   MMDAgent-EX をプライベートネットワークに許可し（初回起動時に確認が出ます）、
   ポート 48000 と 48001 に届くようにしてください。同じ PC で動かすなら設定は
   不要です。
+- **話し始めた直後に音が途切れる（短く鳴ってから一瞬無音になる）** — 次の音声
+  チャンクが届く前にエンジン側の音声が尽きています。`--prebuffer-ms` を上げて
+  ください（例 `600`）。最大でそのぶん話し始めが遅れます。WSL/WSLg の音声出力も
+  再生開始時の揺らぎを加えます。
 - **"cannot create the audio_playback stream"** — エンジンのマシンに音声出力
   デバイスがないか、ストリームがすでに 4 本（エンジンの上限）開いています。
 - **"lip sync for 'x' is unavailable ... (409)"** — そのモデルの口は別の再生

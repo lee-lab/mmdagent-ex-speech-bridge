@@ -64,7 +64,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import websockets
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 log = logging.getLogger("speech_bridge")
 
@@ -75,6 +75,7 @@ log = logging.getLogger("speech_bridge")
 DEFAULT_REST_PORT = 48000
 TTS_SAMPLE_RATE = 24000          # OpenAI "pcm" output: 24 kHz mono s16le
 MAX_CHUNK_BYTES = 4096           # payload size limit per WebSocket frame
+DEFAULT_PREBUFFER_MS = 300       # audio held back before the first push of an utterance
 MAX_LEAD_S = 10.0                # never push more audio ahead of playback than this
 FALLBACK_MARGIN_S = 1.0          # completion timer slack for engines without "drained"
 ECHO_GUARD_S = 0.4               # mic stays muted this long after the bridge stops speaking
@@ -167,6 +168,26 @@ def fallback_deadline(first_send: float, last_send: float, samples: int, rate: i
     last chunk arrived either.
     """
     return max(first_send + samples / rate, last_send) + margin
+
+
+def prebuffer(chunks: Iterable[bytes], nbytes: int) -> Iterator[bytes]:
+    """Hold back the start of a stream until `nbytes` are collected (or it ends).
+
+    The first item is that accumulated block; everything after passes through.
+    The engine starts playing as soon as audio arrives, so a lone first network
+    chunk would underrun (a dropout) before the next one comes. nbytes <= 0
+    passes everything through unchanged.
+    """
+    it = iter(chunks)
+    if nbytes > 0:
+        head = bytearray()
+        for chunk in it:
+            head += chunk
+            if len(head) >= nbytes:
+                break
+        if head:
+            yield bytes(head)
+    yield from it
 
 
 def rechunk(chunks: Iterable[bytes], size: int = MAX_CHUNK_BYTES) -> Iterator[bytes]:
@@ -543,6 +564,7 @@ class Utterance:
     started: bool = False       # SYNTH_EVENT_START was sent
     eos_sent: bool = False
     finished: bool = False      # SYNTH_EVENT_STOP handled (by completion or stop)
+    prebuffered: int = 0        # bytes held back before the first push
 
 
 class Bridge:
@@ -895,7 +917,16 @@ class Bridge:
         src = gen = None
         try:
             src = self.tts.synthesize(u.text, u.voice)
-            gen = rechunk(src)
+            hold_ms = getattr(self.args, "prebuffer_ms", DEFAULT_PREBUFFER_MS)
+            hold = self.tts.sample_rate * max(hold_ms, 0) // 1000 * 2
+            head = prebuffer(src, hold)
+
+            def counted() -> Iterator[bytes]:
+                for i, block in enumerate(head):
+                    if i == 0 and hold > 0:
+                        u.prebuffered = len(block)
+                    yield block
+            gen = rechunk(counted())
             for chunk in gen:
                 if u.cancel.is_set():
                     break
@@ -960,8 +991,10 @@ class Bridge:
         self._end_speaking()
         if u.pushed:
             how = "drained" if u.drained.is_set() else "timer"
-            log.info('[tts] %s: "%s" → %.1f s (first audio after %.2f s, end by %s)%s', u.model,
-                     short(u.text), samples / rate, t_first - t_req, how,
+            pre = (f", prebuffer {u.prebuffered * 500 // rate} ms"
+                   if log.isEnabledFor(logging.DEBUG) else "")
+            log.info('[tts] %s: "%s" → %.1f s (first audio after %.2f s, end by %s%s)%s', u.model,
+                     short(u.text), samples / rate, t_first - t_req, how, pre,
                      " [synthesis failed midway]" if failed else "")
 
     def _log_tts_error(self, e: Exception) -> None:
@@ -1191,6 +1224,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--voice", default=DEFAULT_VOICE,
                    help=f"TTS voice when a script's voice is unknown (default {DEFAULT_VOICE})")
     g.add_argument("--instructions", default=None, help="tone-of-voice prompt for the TTS model")
+    g.add_argument("--prebuffer-ms", type=int, default=DEFAULT_PREBUFFER_MS, metavar="MS",
+                   help="audio collected before an utterance starts playing, against dropouts "
+                        f"(default {DEFAULT_PREBUFFER_MS}; 0 = off)")
     g.add_argument("--tts-model", default="gpt-4o-mini-tts", help="default gpt-4o-mini-tts")
     g.add_argument("--asr-model", default="gpt-4o-mini-transcribe",
                    help="default gpt-4o-mini-transcribe")
