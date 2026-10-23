@@ -58,13 +58,13 @@ import time
 import urllib.error
 import urllib.request
 import wave
-from dataclasses import dataclass, field
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass, field
 
 import numpy as np
 import websockets
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 log = logging.getLogger("speech_bridge")
 
@@ -82,6 +82,7 @@ MIC_RATE = 16000
 MIC_FRAME_MS = 20
 MAX_RECOG_CHARS = 500            # keep bus messages well under the engine's buffer size
 STATUS_TIMEOUT_S = 5.0
+REPLAY_WINDOW_MS = 5000          # = the Lua runtime's wait for SYNTH_EVENT_START
 
 # Plugin_API binary stream header (dev/plugin-api-audio-playback.md §5.2)
 STREAM_HEADER = struct.Struct("<BBBBII")
@@ -202,6 +203,45 @@ def frame_dbfs(frame: bytes) -> float:
         return -100.0
     rms = math.sqrt(float(np.mean(x * x))) / 32768.0
     return max(20.0 * math.log10(rms), -100.0) if rms > 0 else -100.0
+
+
+def same_event(ws_ts: float, buffer_ts: float) -> bool:
+    """Could a WS event and an event-history entry be the same message?
+
+    WS events carry whole seconds (time(NULL) * 1000); the history keeps
+    milliseconds from a separate clock read, which may fall on either side of
+    a second boundary.
+    """
+    return ws_ts - 1000 <= buffer_ts < ws_ts + 2000
+
+
+def select_replays(events: Iterable[dict], cutoff_ms: float = 0.0,
+                   handled: Iterable[tuple[str, float]] = ()) -> list[dict]:
+    """Pick the SYNTH_START requests from the event history that still need an answer.
+
+    `events` are /api/v1/events/recent entries ({timestamp, type, args},
+    oldest first). Per model alias the newest SYNTH_START is taken, unless a
+    later SYNTH_STOP or SYNTH_EVENT_START for that alias follows it (stopped,
+    or already answered by someone). Entries older than `cutoff_ms` (the last
+    message the bridge processed over the WebSocket) and SYNTH_STARTs in
+    `handled` ((args, ws timestamp) pairs) are ignored. Returns the selected
+    entries oldest first.
+    """
+    handled = list(handled)
+    newest: dict[str, dict] = {}
+    for e in events:
+        etype, args, ts = e.get("type"), str(e.get("args", "")), float(e.get("timestamp", 0))
+        alias = args.split("|", 1)[0].strip()
+        if etype == "SYNTH_START":
+            if ts < cutoff_ms or parse_synth_start(args) is None:
+                continue
+            if any(a == args and same_event(t, ts) for a, t in handled):
+                newest.pop(alias, None)          # superseded by one handled live
+                continue
+            newest[alias] = e
+        elif etype in ("SYNTH_STOP", "SYNTH_EVENT_START"):
+            newest.pop(alias, None)
+    return sorted(newest.values(), key=lambda e: float(e.get("timestamp", 0)))
 
 
 def short(text: str, n: int = 40) -> str:
@@ -524,6 +564,9 @@ class Bridge:
         self._speaking = False
         self._gate_until = 0.0
         self._was_connected = False
+        self._last_ws_ts = 0.0           # timestamp of the last bus event read over the WS
+        self._live_starts: collections.deque[tuple[str, float]] = collections.deque(maxlen=64)
+        self._replayed: collections.deque[tuple[str, float]] = collections.deque(maxlen=64)
         self.on_connected: Callable[[], None] | None = None
 
     # ----- thread-safe API used by the microphone / keyboard threads -----
@@ -591,18 +634,24 @@ class Bridge:
                                  "--mmdagent-key / MMDAGENT_API_KEY") from e
             raise
         self.ws = ws
+        cutoff = self._last_ws_ts        # what earlier sessions already saw
         try:
             if self.tts is not None:
+                # stream first: a SYNTH_START read while waiting for the ack needs it
+                await self._open_stream()
                 events = ["SYNTH_START", "SYNTH_STOP", "APIAUDIO_EVENT_DRAINED",
                           "stream.audio_playback.*"]
                 await ws.send(json.dumps({"action": "subscribe", "events": events}))
-                await self._open_stream()
+                await self._wait_ack(ws)
             self._was_connected = True
-            log.info("[engine] connected to %s (%s %s)", self.rest.base,
-                     body.get("platform", "?"), body.get("version", ""))
+            log.info("[engine] connected to %s (%s %s)%s", self.rest.base,
+                     body.get("platform", "?"), body.get("version", ""),
+                     ", subscribed to SYNTH_START / SYNTH_STOP" if self.tts else "")
             if self.on_connected:
                 self.on_connected()
                 self.on_connected = None
+            if self.tts is not None:
+                await self._replay_missed(cutoff)
             async for msg in ws:
                 if isinstance(msg, str):
                     self._on_text(msg)
@@ -634,6 +683,35 @@ class Bridge:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    async def _wait_ack(self, ws) -> None:
+        """Read until the engine acknowledges the subscription (events seen meanwhile are handled)."""
+        deadline = time.monotonic() + STATUS_TIMEOUT_S
+        while True:
+            msg = await asyncio.wait_for(ws.recv(), timeout=max(deadline - time.monotonic(), 0.1))
+            if isinstance(msg, str):
+                with contextlib.suppress(ValueError):
+                    if json.loads(msg).get("ack") is True:
+                        return
+                self._on_text(msg)
+
+    async def _replay_missed(self, cutoff: float) -> None:
+        """Answer SYNTH_STARTs sent before the subscription was up (engine startup greeting)."""
+        try:
+            status, data = await self._rest("GET", f"/events/recent?since_ms={REPLAY_WINDOW_MS}")
+        except OSError as e:
+            log.debug("[tts] event history unavailable: %s", e)
+            return
+        if status != 200:
+            log.debug("[tts] event history unavailable (%d)", status)
+            return
+        now = float(data.get("now", 0))
+        for e in select_replays(data.get("events", []), cutoff, self._live_starts):
+            args, ts = str(e["args"]), float(e["timestamp"])
+            self._replayed.append((args, ts))
+            log.info("[tts] replaying SYNTH_START missed during connect: %s (%.1f s ago)",
+                     short(args, 60), (now - ts) / 1000 if now else 0.0)
+            await self._on_synth_start(*parse_synth_start(args))
+
     def _on_text(self, msg: str) -> None:
         try:
             data = json.loads(msg)
@@ -644,11 +722,17 @@ class Bridge:
             return
         args = str(data.get("args", ""))
         log.debug("<- %s", f"{event}|{args}" if args else msg)
+        ws_ts = float(data.get("timestamp", 0) or 0)
+        if event != "stream.lifecycle" and ws_ts:
+            self._last_ws_ts = max(self._last_ws_ts, ws_ts)
         if event == "SYNTH_START":
             parsed = parse_synth_start(args)
             if parsed is None:
                 log.warning("[tts] ignoring SYNTH_START without a model alias: %r", args)
+            elif any(a == args and same_event(ws_ts, t) for a, t in self._replayed):
+                log.debug("[tts] SYNTH_START already answered from the event history")
             elif self.tts is not None:
+                self._live_starts.append((args, ws_ts))
                 self._spawn(self._on_synth_start(*parsed))
         elif event == "SYNTH_STOP" and self.tts is not None:
             self._spawn(self._on_synth_stop(args.split("|", 1)[0].strip()))

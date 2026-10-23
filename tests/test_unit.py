@@ -454,3 +454,77 @@ def test_mic_opens_at_native_rate_and_resamples():
         sd.callback(np.zeros(960, dtype="<i2").tobytes(), 960, None, None)
     frames = [mic.frames.get_nowait() for _ in range(mic.frames.qsize())]
     assert len(frames) == 3 and all(len(f) == 640 for f in frames)
+
+
+# ----- replay of SYNTH_START missed while connecting -----
+
+def ev(ts, etype, args):
+    return {"timestamp": ts, "type": etype, "args": args}
+
+
+def test_replay_picks_newest_start_per_alias():
+    events = [
+        ev(1000, "SYNTH_START", "gene|v|old"),
+        ev(1500, "MODEL_EVENT_ADD", "gene"),
+        ev(2000, "SYNTH_START", "gene|v|new"),
+        ev(2100, "SYNTH_START", "mei|v|hello"),
+    ]
+    picked = sb.select_replays(events)
+    assert [e["args"] for e in picked] == ["gene|v|new", "mei|v|hello"]
+
+
+def test_replay_skips_stopped_or_answered():
+    events = [
+        ev(1000, "SYNTH_START", "gene|v|a"),
+        ev(1100, "SYNTH_STOP", "gene"),
+        ev(1200, "SYNTH_START", "mei|v|b"),
+        ev(1300, "SYNTH_EVENT_START", "mei"),          # another provider answered
+        ev(1400, "SYNTH_START", "uka|v|c"),
+        ev(1500, "SYNTH_EVENT_STOP", "uka"),           # not an answer to this request
+        ev(1600, "RECOG_EVENT_STOP", "uka|x"),         # unrelated (bridge's own type)
+    ]
+    assert [e["args"] for e in sb.select_replays(events)] == ["uka|v|c"]
+
+
+def test_replay_start_after_stop_is_kept():
+    events = [ev(1000, "SYNTH_STOP", "gene"), ev(1100, "SYNTH_START", "gene|v|again")]
+    assert [e["args"] for e in sb.select_replays(events)] == ["gene|v|again"]
+
+
+def test_replay_respects_cutoff():
+    events = [ev(4000, "SYNTH_START", "gene|v|seen before"), ev(6500, "SYNTH_START", "mei|v|new")]
+    assert [e["args"] for e in sb.select_replays(events, cutoff_ms=5000)] == ["mei|v|new"]
+
+
+def test_replay_skips_starts_handled_live():
+    # WS timestamps are whole seconds; the history keeps milliseconds
+    events = [ev(12345, "SYNTH_START", "gene|v|hi"), ev(12400, "SYNTH_START", "mei|v|x")]
+    picked = sb.select_replays(events, handled=[("gene|v|hi", 12000.0)])
+    assert [e["args"] for e in picked] == ["mei|v|x"]
+    # a live one also supersedes an older missed request of the same alias
+    events = [ev(11000, "SYNTH_START", "gene|v|missed"), ev(12345, "SYNTH_START", "gene|v|hi")]
+    assert sb.select_replays(events, handled=[("gene|v|hi", 12000.0)]) == []
+
+
+def test_replay_ignores_malformed():
+    assert sb.select_replays([ev(1, "SYNTH_START", ""), ev(2, "SYNTH_START", "|v|t")]) == []
+
+
+def test_same_event_window():
+    assert sb.same_event(12000, 11999)       # clock read just before the second turned
+    assert sb.same_event(12000, 12999)
+    assert sb.same_event(12000, 13500)
+    assert not sb.same_event(12000, 10900)
+    assert not sb.same_event(12000, 14100)
+
+
+def test_replayed_start_is_not_handled_again_live():
+    bridge, _ = make_bridge(engine_without_flush)
+    spawned = []
+    bridge._spawn = lambda coro: (coro.close(), spawned.append(1))
+    bridge._replayed.append(("gene|v|hi", 12345.0))
+    bridge._on_text(json.dumps({"event": "SYNTH_START", "args": "gene|v|hi", "timestamp": 12000}))
+    assert spawned == [] and list(bridge._live_starts) == []
+    assert bridge._last_ws_ts == 12000
+    bridge._on_text(json.dumps({"event": "SYNTH_START", "args": "gene|v|next", "timestamp": 13000}))
+    assert spawned == [1] and list(bridge._live_starts) == [("gene|v|next", 13000.0)]

@@ -47,8 +47,10 @@ by the engine from the audio it plays).
 
 3. **Start MMDAgent-EX** with your content. Plugin_API is part of the standard
    build and listens on ports 48000 (REST) and 48001 (WebSocket); the bridge
-   finds it there. The order does not matter: the bridge waits for the engine
-   and reconnects when it restarts.
+   finds it there. The order does not matter: the bridge may be started before
+   the engine, and speech requested in the first seconds after the engine
+   starts (a startup greeting) is picked up. The bridge reconnects when the
+   engine restarts.
 
 When a script sends `SYNTH_START`, the character speaks; when you talk into the
 microphone, the script receives `RECOG_EVENT_STOP|<what you said>`. A session
@@ -126,6 +128,10 @@ with `--tts-model tts-1` pick e.g. `--voice nova`.
 
 - Everything after the second `|` of `SYNTH_START` is the text.
 - In recognized text, `|` and line breaks become spaces; empty results are not sent.
+- Requests sent while the bridge was not yet connected (the engine's startup
+  greeting, or a bridge restart) are answered after connecting: the bridge reads
+  the engine's event history of the last 5 s and replays the newest
+  `SYNTH_START` per model that nobody stopped or answered.
 - If synthesis fails (network, key), the bridge logs why and still sends
   `SYNTH_EVENT_START` followed by `SYNTH_EVENT_STOP`, so scripts never hang.
 - **Half duplex**: from the first audio of an utterance until 0.4 s after it
