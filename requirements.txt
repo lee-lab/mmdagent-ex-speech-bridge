@@ -1,0 +1,5 @@
+# Same minimum versions as the PEP 723 block in speech_bridge.py
+openai>=1.68
+websockets>=14
+sounddevice>=0.5.1
+numpy>=1.24
