@@ -693,7 +693,7 @@ class RealtimeSession:
         self._announce = True              # log the next successful connect at info level
         self.on_event, self.on_open, self.on_close, self.is_idle = (
             on_event, on_open, on_close, is_idle)
-        self.loop = asyncio.new_event_loop()
+        self.loop: asyncio.AbstractEventLoop | None = None      # created by start()
         self.connected = threading.Event()
         self.fatal: str | None = None      # set when retrying cannot help (key rejected)
         self._q: asyncio.Queue | None = None
@@ -705,12 +705,15 @@ class RealtimeSession:
 
     def start(self) -> None:
         if self._thread is None:
+            self.loop = asyncio.new_event_loop()
             self._thread = threading.Thread(target=self._thread_main,
                                             name=f"realtime-{self.tag}", daemon=True)
             self._thread.start()
 
     def call(self, fn: Callable, *args) -> None:
         """Run fn(*args) on the session thread (thread-safe, does not wait)."""
+        if self.loop is None:
+            raise RuntimeError(f"realtime session '{self.tag}' used before start()")
         with contextlib.suppress(RuntimeError):         # loop closed at exit
             self.loop.call_soon_threadsafe(fn, *args)
 
