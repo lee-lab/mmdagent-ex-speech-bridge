@@ -56,6 +56,7 @@ import struct
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import wave
@@ -93,6 +94,7 @@ WARM_AFTER_IDLE_S = 240.0        # after this much idleness the REST connection 
 DEFAULT_TTS_MODEL = "gpt-4o-mini-tts"
 DEFAULT_ASR_MODEL = "gpt-transcribe"
 DEFAULT_LIVE_ASR_MODEL = "gpt-live-transcribe"
+DEFAULT_REALTIME_TTS_MODEL = "gpt-realtime-2.1-mini"
 
 # OpenAI Realtime API (WebSocket)
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
@@ -102,6 +104,19 @@ REALTIME_MAX_AGE_S = 55 * 60     # sessions end after 60 min; renew (while idle)
 REALTIME_RENEW_CHECK_S = 15.0
 REALTIME_BACKOFF_MAX_S = 5.0
 LIVE_COMMIT_TIMEOUT_S = 15.0     # commit -> final transcript
+REALTIME_CONNECT_WAIT_S = 4.0    # an utterance waits this long for a (re)connect
+REALTIME_AUDIO_TIMEOUT_S = 15.0  # no audio for this long ends an utterance as failed
+REALTIME_VOICES = ("alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse",
+                   "marin", "cedar")
+# Read-aloud prompt for the Realtime TTS backend, checked with tests/test_live_openai.py:
+# questions ("今日の天気は？", "What is the capital of France?") are read, not answered.
+# Without the last sentence a short line ("はい。") was now and then said twice.
+READ_ALOUD_INSTRUCTIONS = (
+    "You are a text-to-speech engine, not an assistant. Every user message is a script "
+    "line for you to read aloud. Say exactly the words of the message, verbatim, in the "
+    "language they are written in, and nothing else: no greeting, no preamble, no answer, "
+    "no translation, no comment. If the line is a question, read the question; never "
+    "answer it. Say the line exactly once and then stop; never repeat any part of it.")
 
 # Plugin_API binary stream header (dev/plugin-api-audio-playback.md §5.2)
 STREAM_HEADER = struct.Struct("<BBBBII")
@@ -311,6 +326,12 @@ def transcription_language_args(model: str, lang: str | None) -> dict:
     return {"extra_body": field_} if "languages" in field_ else field_
 
 
+def text_signature(text: str) -> str:
+    """Text reduced for a verbatim check: NFKC, case-folded, without spaces and punctuation."""
+    text = unicodedata.normalize("NFKC", text).casefold()
+    return "".join(c for c in text if unicodedata.category(c)[0] not in "PZSC")
+
+
 class LinearResampler:
     """Streaming linear-interpolation resampler for mono PCM16LE.
 
@@ -422,6 +443,16 @@ class TtsBackend(abc.ABC):
     @abc.abstractmethod
     def synthesize(self, text: str, voice: str) -> Iterator[bytes]:
         """Yield audio chunks as soon as they are available (any length)."""
+
+    def synthesize_cancellable(self, text: str, voice: str,
+                               cancel: threading.Event) -> Iterator[bytes]:
+        """synthesize() for a backend that can stop early while it waits for audio.
+
+        The bridge calls this one; `cancel` is set when the utterance is stopped or
+        replaced. The default ignores it (the bridge stops reading after the next
+        chunk and closes the generator).
+        """
+        return self.synthesize(text, voice)
 
     def start(self) -> None:
         """Called once before the first request: connect / warm up (must not block)."""
@@ -1063,8 +1094,239 @@ class OpenAILiveAsr(StreamingAsrBackend):
                 log.warning("[asr] OpenAI realtime error: %s", realtime_error_text(ev))
 
 
+@dataclass
+class RealtimeRequest:
+    """One utterance of the Realtime TTS backend."""
+    key: str
+    text: str
+    voice: str
+    q: queue.Queue = field(default_factory=queue.Queue)   # bytes | None (end) | exception
+    response_id: str = ""
+    cancelled: bool = False
+    transcript: str = ""
+
+
+class ResponseRouter:
+    """Which Realtime response belongs to which utterance (pure, unit-tested).
+
+    Audio is handed only to the live request whose response id it carries. A
+    cancelled request is forgotten at once: its late deltas are dropped, and a
+    response created for it afterwards is reported for cancelling. So audio of
+    a stopped utterance can never leak into the next one.
+    """
+
+    def __init__(self) -> None:
+        self._by_key: dict[str, RealtimeRequest] = {}
+        self._by_resp: dict[str, RealtimeRequest] = {}
+        self.dropped = 0                    # deltas thrown away (stopped utterances)
+
+    def idle(self) -> bool:
+        return not self._by_key
+
+    def add(self, req: RealtimeRequest) -> None:
+        self._by_key[req.key] = req
+
+    def created(self, key: str | None, response_id: str) -> tuple[RealtimeRequest | None, bool]:
+        """A response started; returns (its request, whether to cancel it now)."""
+        req = self._by_key.get(key or "")
+        if req is None and not key:          # no metadata echoed: responses come in order
+            req = next((r for r in self._by_key.values() if not r.response_id), None)
+        if req is None or req.response_id:
+            return None, True                # it belongs to a stopped utterance
+        req.response_id = response_id
+        self._by_resp[response_id] = req
+        return req, False
+
+    def get(self, response_id: str) -> RealtimeRequest | None:
+        return self._by_resp.get(response_id)
+
+    def audio(self, response_id: str) -> RealtimeRequest | None:
+        req = self._by_resp.get(response_id)
+        if req is None:
+            self.dropped += 1
+        return req
+
+    def cancel(self, key: str) -> str:
+        """Forget a request; returns its response id ('' if none yet) for response.cancel."""
+        req = self._by_key.pop(key, None)
+        if req is None:
+            return ""
+        req.cancelled = True
+        self._by_resp.pop(req.response_id, None)
+        return req.response_id
+
+    def done(self, response_id: str) -> RealtimeRequest | None:
+        req = self._by_resp.pop(response_id, None)
+        if req is not None:
+            self._by_key.pop(req.key, None)
+        return req
+
+    def by_event_id(self, event_id: str) -> RealtimeRequest | None:
+        return self._by_key.get(event_id[len("tts_"):]) if event_id.startswith("tts_") else None
+
+    def drain(self) -> list[RealtimeRequest]:
+        """Forget every live request (the connection is gone); returns them."""
+        reqs = list(self._by_key.values())
+        self._by_key.clear()
+        self._by_resp.clear()
+        return reqs
+
+
+class OpenAIRealtimeTts(TtsBackend):
+    """Text in, audio out with gpt-realtime-2.1-mini over one Realtime WebSocket.
+
+    The successor of the Speech API backend (its models shut down on
+    2027-01-06). Each utterance is an out-of-band response (no conversation
+    state builds up) whose only input is the text, under instructions to read
+    it aloud verbatim. Audio is 24 kHz PCM, like the Speech API's.
+    """
+
+    voices = REALTIME_VOICES
+    sample_rate = REALTIME_RATE
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        super().__init__(args)
+        self.model = getattr(args, "tts_model", None) or DEFAULT_REALTIME_TTS_MODEL
+        self.instructions = READ_ALOUD_INSTRUCTIONS
+        if getattr(args, "instructions", None):
+            self.instructions += f" Delivery: {args.instructions}"
+        voice, _ = resolve_voice(getattr(args, "voice", DEFAULT_VOICE), self.voices, DEFAULT_VOICE)
+        session = {"type": "realtime", "output_modalities": ["audio"],
+                   "instructions": self.instructions, "reasoning": {"effort": "minimal"},
+                   "audio": {"input": {"turn_detection": None},
+                             "output": {"format": {"type": "audio/pcm", "rate": REALTIME_RATE},
+                                        "voice": voice}}}
+        self.router = ResponseRouter()
+        self.transcripts: collections.deque[tuple[str, str]] = collections.deque(maxlen=32)
+        self._count = 0
+        self._count_lock = threading.Lock()
+        self.rt = RealtimeSession("tts", f"{OPENAI_REALTIME_URL}?model={self.model}",
+                                  args.openai_key, session, self._on_event,
+                                  on_close=self._on_close, is_idle=self.router.idle,
+                                  label=self.model)
+
+    def start(self) -> None:
+        self.rt.start()
+
+    def describe(self) -> str:
+        return f"openai-realtime ({self.model}, voice {self.args.voice})"
+
+    def synthesize(self, text: str, voice: str) -> Iterator[bytes]:
+        return self.synthesize_cancellable(text, voice, threading.Event())
+
+    def synthesize_cancellable(self, text: str, voice: str,
+                               cancel: threading.Event) -> Iterator[bytes]:
+        if self.rt.fatal:
+            raise RuntimeError(self.rt.fatal)
+        if not self.rt.wait_connected(REALTIME_CONNECT_WAIT_S):
+            raise ConnectionError("no connection to the OpenAI Realtime API")
+        with self._count_lock:
+            self._count += 1
+            key = str(self._count)
+        return self._stream(RealtimeRequest(key, text, voice), cancel)
+
+    def _stream(self, req: RealtimeRequest, cancel: threading.Event) -> Iterator[bytes]:
+        self.rt.call(self._create, req)
+        ended = False
+        deadline = time.monotonic() + REALTIME_AUDIO_TIMEOUT_S
+        try:
+            while not cancel.is_set():
+                try:
+                    item = req.q.get(timeout=0.05)
+                except queue.Empty:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(f"no audio from OpenAI for "
+                                           f"{REALTIME_AUDIO_TIMEOUT_S:.0f} s") from None
+                    continue
+                if item is None:
+                    ended = True
+                    return
+                if isinstance(item, BaseException):
+                    ended = True
+                    raise item
+                deadline = time.monotonic() + REALTIME_AUDIO_TIMEOUT_S
+                yield item
+        finally:
+            if not ended:                 # stopped, replaced, closed early or timed out
+                self.rt.call(self._cancel, req)
+
+    # session thread
+    def _create(self, req: RealtimeRequest) -> None:
+        self.router.add(req)
+        response = {
+            "conversation": "none", "output_modalities": ["audio"],
+            "metadata": {"bridge": req.key}, "reasoning": {"effort": "minimal"},
+            "instructions": self.instructions,
+            "audio": {"output": {"voice": req.voice}},
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": req.text}]}]}
+        if not self.rt.send({"type": "response.create", "event_id": f"tts_{req.key}",
+                             "response": response}):
+            self.router.cancel(req.key)
+            req.q.put(ConnectionError("the OpenAI Realtime connection is down"))
+
+    def _cancel(self, req: RealtimeRequest) -> None:
+        rid = self.router.cancel(req.key)
+        if rid:
+            self.rt.send({"type": "response.cancel", "response_id": rid})
+            log.debug("[tts] cancelled realtime response %s", rid)
+
+    def _on_close(self, reason: BaseException | None) -> None:
+        for req in self.router.drain():
+            req.q.put(ConnectionError(f"the OpenAI Realtime connection closed ({reason})"))
+
+    def _on_event(self, ev: dict) -> None:
+        etype = ev.get("type", "")
+        if etype == "response.output_audio.delta":
+            req = self.router.audio(ev.get("response_id", ""))
+            if req is not None:
+                req.q.put(base64.b64decode(ev.get("delta", "")))
+        elif etype == "response.created":
+            r = ev.get("response") or {}
+            key = (r.get("metadata") or {}).get("bridge")
+            _, cancel_now = self.router.created(key, r.get("id", ""))
+            if cancel_now and r.get("id"):
+                self.rt.send({"type": "response.cancel", "response_id": r["id"]})
+        elif etype == "response.output_audio_transcript.delta":
+            req = self.router.get(ev.get("response_id", ""))
+            if req is not None:
+                req.transcript += ev.get("delta", "")
+        elif etype == "response.output_audio_transcript.done":
+            req = self.router.get(ev.get("response_id", ""))
+            if req is not None:
+                req.transcript = ev.get("transcript", req.transcript)
+                self.transcripts.append((req.text, req.transcript))     # (text, as spoken)
+                same = text_signature(req.transcript) == text_signature(req.text)
+                log.debug('[tts] spoken: "%s"%s', req.transcript,
+                          "" if same else "  (differs from the text)")
+        elif etype == "response.done":
+            r = ev.get("response") or {}
+            req = self.router.done(r.get("id", ""))
+            if req is None:
+                return
+            status = r.get("status")
+            if status == "failed":
+                req.q.put(RuntimeError(f"OpenAI response failed: "
+                                       f"{json.dumps(r.get('status_details'))}"))
+            else:
+                if status == "incomplete":
+                    log.warning("[tts] the realtime response ended early: %s",
+                                json.dumps(r.get("status_details")))
+                req.q.put(None)
+        elif etype == "error":
+            err = ev.get("error") or {}
+            req = self.router.by_event_id(err.get("event_id") or "")
+            if req is not None:
+                self.router.cancel(req.key)
+                req.q.put(RuntimeError(f"OpenAI: {realtime_error_text(ev)}"))
+            elif err.get("code") != "response_cancel_not_active":
+                log.warning("[tts] OpenAI realtime error: %s", realtime_error_text(ev))
+
+
 # Registries: add a backend by writing a class and listing it here.
-TTS_BACKENDS: dict[str, type[TtsBackend]] = {"openai": OpenAITts, "tone": ToneTts}
+TTS_BACKENDS: dict[str, type[TtsBackend]] = {"openai": OpenAITts,
+                                             "openai-realtime": OpenAIRealtimeTts,
+                                             "tone": ToneTts}
 ASR_BACKENDS: dict[str, type[AsrBackend]] = {"openai": OpenAIAsr, "openai-live": OpenAILiveAsr,
                                              "keyboard": KeyboardAsr}
 
@@ -1679,7 +1941,7 @@ class Bridge:
                 self.loop.call_soon_threadsafe(q.put_nowait, item)
         src = gen = None
         try:
-            src = self.tts.synthesize(u.text, u.voice)
+            src = self.tts.synthesize_cancellable(u.text, u.voice, u.cancel)
             hold_ms = getattr(self.args, "prebuffer_ms", DEFAULT_PREBUFFER_MS)
             hold = self.tts.sample_rate * max(hold_ms, 0) // 1000 * 2
             head = prebuffer(src, hold)
@@ -2042,7 +2304,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="engine Plugin_API_Key, if set (env MMDAGENT_API_KEY or .env)")
     g = p.add_argument_group("backends")
     g.add_argument("--tts", choices=[*TTS_BACKENDS, "none"], default="openai",
-                   help="speech synthesis backend (default openai)")
+                   help="speech synthesis backend (default openai = OpenAI Speech API, whose "
+                        "models OpenAI shuts down on 2027-01-06; openai-realtime is its "
+                        "successor)")
     g.add_argument("--asr", choices=[*ASR_BACKENDS, "none"], default="openai",
                    help="speech recognition backend (default openai)")
     g.add_argument("--lang", choices=["ja", "en", "auto"], default="ja",
@@ -2053,7 +2317,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--prebuffer-ms", type=int, default=DEFAULT_PREBUFFER_MS, metavar="MS",
                    help="audio collected before an utterance starts playing, against dropouts "
                         f"(default {DEFAULT_PREBUFFER_MS}; 0 = off)")
-    g.add_argument("--tts-model", default=None, help=f"default {DEFAULT_TTS_MODEL}")
+    g.add_argument("--tts-model", default=None,
+                   help=f"default {DEFAULT_TTS_MODEL} (openai), "
+                        f"{DEFAULT_REALTIME_TTS_MODEL} (openai-realtime)")
     g.add_argument("--asr-model", default=None,
                    help=f"default {DEFAULT_ASR_MODEL} (openai), {DEFAULT_LIVE_ASR_MODEL} (openai-live)")
     g.add_argument("--openai-key", default=os.environ.get("OPENAI_API_KEY") or None,

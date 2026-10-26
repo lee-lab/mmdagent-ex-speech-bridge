@@ -222,7 +222,7 @@ def test_fallback_deadline_slow_synthesis():
 # ----- backends -----
 
 def test_backend_registry():
-    assert set(sb.TTS_BACKENDS) == {"openai", "tone"}
+    assert set(sb.TTS_BACKENDS) == {"openai", "openai-realtime", "tone"}
     assert set(sb.ASR_BACKENDS) == {"openai", "openai-live", "keyboard"}
     for cls in sb.TTS_BACKENDS.values():
         assert issubclass(cls, sb.TtsBackend)
@@ -230,7 +230,7 @@ def test_backend_registry():
         assert issubclass(cls, sb.AsrBackend)
     assert sb.KeyboardAsr.needs_microphone is False
     choices = {a.dest: a.choices for a in sb.build_parser()._actions if a.choices}
-    assert choices["tts"] == ["openai", "tone", "none"]
+    assert choices["tts"] == ["openai", "openai-realtime", "tone", "none"]
     assert choices["asr"] == ["openai", "openai-live", "keyboard", "none"]
     assert sb.OpenAILiveAsr.streaming and not sb.OpenAIAsr.streaming
 
@@ -876,6 +876,9 @@ class FakeRealtime:
     def call(self, fn, *args):
         fn(*args)
 
+    def wait_connected(self, timeout):
+        return self.connected
+
     def send(self, event):
         if not self.connected:
             return False
@@ -990,3 +993,196 @@ def test_mic_listener_streams_through_live_backend():
         sb.time.sleep(0.01)
     assert bridge.emitted == [("RECOG_EVENT_START", ""), ("RECOG_EVENT_STOP", "テスト です")]
     assert mic.streamer.bytes_appended > 0
+
+
+# ----- realtime TTS: verbatim check, response routing, cancel / leak guard -----
+
+def test_text_signature():
+    assert sb.text_signature("今日の天気は？") == sb.text_signature("今日の天気は?")
+    assert sb.text_signature("Hello,  World!") == sb.text_signature("hello world")
+    assert sb.text_signature("はい。") != sb.text_signature("いいえ。")
+
+
+def test_router_cancel_before_created_cancels_the_response_later():
+    r = sb.ResponseRouter()
+    a = sb.RealtimeRequest("1", "a", "marin")
+    r.add(a)
+    assert r.cancel("1") == "" and a.cancelled and r.idle()
+    req, cancel_now = r.created("1", "resp_a")
+    assert req is None and cancel_now
+    assert r.audio("resp_a") is None and r.dropped == 1
+
+
+def test_router_late_delta_of_cancelled_response_is_dropped():
+    r = sb.ResponseRouter()
+    a, b = sb.RealtimeRequest("1", "a", "v"), sb.RealtimeRequest("2", "b", "v")
+    r.add(a)
+    assert r.created("1", "resp_a") == (a, False)
+    assert r.audio("resp_a") is a
+    assert r.cancel("1") == "resp_a"
+    r.add(b)
+    r.created("2", "resp_b")
+    assert r.audio("resp_a") is None                  # never reaches b
+    assert r.audio("resp_b") is b
+    assert r.done("resp_b") is b and r.idle()
+
+
+def test_router_without_metadata_assigns_in_order_and_routes_errors():
+    r = sb.ResponseRouter()
+    a, b = sb.RealtimeRequest("1", "a", "v"), sb.RealtimeRequest("2", "b", "v")
+    r.add(a)
+    r.add(b)
+    assert r.created(None, "x")[0] is a and r.created(None, "y")[0] is b
+    assert r.by_event_id("tts_2") is b and r.by_event_id("other") is None
+    assert r.drain() == [a, b] and r.idle()
+
+
+def make_realtime_tts(**kw):
+    args = types.SimpleNamespace(openai_key="sk-test", tts_model=None, voice="marin",
+                                 instructions=None, **kw)
+    tts = sb.OpenAIRealtimeTts(args)
+    tts.rt = FakeRealtime()
+    return tts
+
+
+def wait_for(cond, timeout=5.0):
+    deadline = sb.time.monotonic() + timeout
+    while not cond():
+        assert sb.time.monotonic() < deadline, "timed out"
+        sb.time.sleep(0.005)
+
+
+def test_realtime_tts_session_and_request_shape():
+    tts = sb.OpenAIRealtimeTts(types.SimpleNamespace(
+        openai_key="k", tts_model=None, voice="cedar", instructions="Speak slowly."))
+    s = tts.rt.session
+    assert tts.rt.url.endswith("/v1/realtime?model=gpt-realtime-2.1-mini")
+    assert s["type"] == "realtime" and s["output_modalities"] == ["audio"]
+    assert s["audio"]["output"] == {"format": {"type": "audio/pcm", "rate": 24000},
+                                    "voice": "cedar"}
+    assert s["audio"]["input"]["turn_detection"] is None
+    assert "verbatim" in s["instructions"] and s["instructions"].endswith("Speak slowly.")
+    assert tts.sample_rate == 24000 and "fable" not in tts.voices
+
+
+def test_realtime_tts_streams_one_response():
+    import threading
+    tts = make_realtime_tts()
+    out = []
+    th = threading.Thread(target=lambda: out.extend(tts.synthesize("こんにちは", "cedar")))
+    th.start()
+    wait_for(lambda: tts.rt.sent)
+    create = tts.rt.sent[0]
+    assert create["type"] == "response.create"
+    resp = create["response"]
+    assert resp["conversation"] == "none" and resp["metadata"] == {"bridge": "1"}
+    assert resp["audio"]["output"]["voice"] == "cedar"
+    assert resp["input"][0]["content"][0] == {"type": "input_text", "text": "こんにちは"}
+    tts._on_event({"type": "response.created",
+                   "response": {"id": "r1", "metadata": {"bridge": "1"}}})
+    for chunk in (b"\x01\x00" * 10, b"\x02\x00" * 5):
+        tts._on_event({"type": "response.output_audio.delta", "response_id": "r1",
+                       "delta": sb.base64.b64encode(chunk).decode()})
+    tts._on_event({"type": "response.output_audio_transcript.done", "response_id": "r1",
+                   "transcript": "こんにちは"})
+    tts._on_event({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+    th.join(5)
+    assert b"".join(out) == b"\x01\x00" * 10 + b"\x02\x00" * 5
+    assert tts.router.idle() and [e["type"] for e in tts.rt.sent] == ["response.create"]
+
+
+def test_realtime_tts_stop_cancels_and_nothing_leaks_into_the_next_utterance():
+    import threading
+    tts = make_realtime_tts()
+    cancel = threading.Event()
+    first = []
+    th = threading.Thread(target=lambda: first.extend(
+        tts.synthesize_cancellable("one", "marin", cancel)))
+    th.start()
+    wait_for(lambda: tts.rt.sent)
+    tts._on_event({"type": "response.created", "response": {"id": "r1",
+                                                           "metadata": {"bridge": "1"}}})
+    tts._on_event({"type": "response.output_audio.delta", "response_id": "r1",
+                   "delta": sb.base64.b64encode(b"\x01\x00").decode()})
+    wait_for(lambda: first)
+    cancel.set()                                              # SYNTH_STOP
+    th.join(5)
+    assert not th.is_alive()
+    assert tts.rt.sent[-1] == {"type": "response.cancel", "response_id": "r1"}
+    second = []
+    th2 = threading.Thread(target=lambda: second.extend(tts.synthesize("two", "marin")))
+    th2.start()
+    wait_for(lambda: len(tts.rt.sent) == 3)
+    # a late delta of the cancelled response arrives after the new request went out
+    tts._on_event({"type": "response.output_audio.delta", "response_id": "r1",
+                   "delta": sb.base64.b64encode(b"\x09\x00" * 100).decode()})
+    tts._on_event({"type": "response.done", "response": {"id": "r1", "status": "cancelled"}})
+    tts._on_event({"type": "response.created", "response": {"id": "r2",
+                                                           "metadata": {"bridge": "2"}}})
+    tts._on_event({"type": "response.output_audio.delta", "response_id": "r2",
+                   "delta": sb.base64.b64encode(b"\x02\x00").decode()})
+    tts._on_event({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+    th2.join(5)
+    assert b"".join(second) == b"\x02\x00" and tts.router.dropped == 1
+
+
+def test_realtime_tts_errors_reach_the_utterance():
+    tts = make_realtime_tts()
+    import threading
+    errs = []
+
+    def run():
+        try:
+            list(tts.synthesize("x", "marin"))
+        except Exception as e:
+            errs.append(e)
+
+    th = threading.Thread(target=run)
+    th.start()
+    wait_for(lambda: tts.rt.sent)
+    tts._on_event({"type": "error", "error": {"message": "bad voice", "event_id": "tts_1"}})
+    th.join(5)
+    assert errs and "bad voice" in str(errs[0]) and tts.router.idle()
+
+    tts.rt.connected = False
+    with pytest.raises(ConnectionError):
+        tts.synthesize("x", "marin")
+
+
+def test_realtime_tts_connection_loss_ends_the_utterance():
+    import threading
+    tts = make_realtime_tts()
+    errs = []
+
+    def run():
+        try:
+            list(tts.synthesize("x", "marin"))
+        except Exception as e:
+            errs.append(e)
+
+    th = threading.Thread(target=run)
+    th.start()
+    wait_for(lambda: tts.rt.sent)
+    tts._on_close(ConnectionError("gone"))
+    th.join(5)
+    assert errs and isinstance(errs[0], ConnectionError)
+
+
+def test_bridge_uses_the_cancellable_entry_point(monkeypatch):
+    seen = []
+
+    async def flow(bridge):
+        orig = bridge.tts.synthesize_cancellable
+
+        def spy(text, voice, cancel):
+            seen.append(cancel)
+            return orig(text, voice, cancel)
+
+        bridge.tts.synthesize_cancellable = spy
+        monkeypatch.setattr(sb, "fallback_deadline", lambda f, l, s, r, margin=0: l + 0.05)
+        await bridge._on_synth_start("gene", "x", "hi")
+        u = bridge.current
+        await asyncio.wait_for(u.task, 5)
+        assert seen == [u.cancel]
+
+    asyncio.run(run_flow(flow))
