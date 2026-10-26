@@ -2308,10 +2308,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--mmdagent-key", default=os.environ.get("MMDAGENT_API_KEY") or None,
                    help="engine Plugin_API_Key, if set (env MMDAGENT_API_KEY or .env)")
     g = p.add_argument_group("backends")
-    g.add_argument("--tts", choices=[*TTS_BACKENDS, "none"], default="openai",
-                   help="speech synthesis backend (default openai = OpenAI Speech API, whose "
-                        "models OpenAI shuts down on 2027-01-06; openai-realtime is its "
-                        "successor)")
+    g.add_argument("--tts", choices=[*TTS_BACKENDS, "none"], default="openai-realtime",
+                   help="speech synthesis backend (default openai-realtime = OpenAI Realtime "
+                        "API; openai = OpenAI Speech API, whose models OpenAI shuts down on "
+                        "2027-01-06)")
     g.add_argument("--asr", choices=[*ASR_BACKENDS, "none"], default="openai",
                    help="speech recognition backend (default openai = one transcription request "
                         "per utterance; openai-live streams each utterance while you speak)")

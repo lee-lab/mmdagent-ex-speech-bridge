@@ -91,19 +91,19 @@ uv run speech_bridge.py --tts tone --asr keyboard
 
 | Option | Model | OpenAI API | Price (2026-10) | Status |
 |---|---|---|---|---|
-| `--tts openai` (default) | `gpt-4o-mini-tts` | Speech (`/v1/audio/speech`, HTTPS) | $0.60 / 1M text tokens in, $12 / 1M audio tokens out | **Deprecated: shuts down 2027-01-06** (also `tts-1`, `tts-1-hd`) |
-| `--tts openai-realtime` | `gpt-realtime-2.1-mini` | Realtime (WebSocket) | $0.60 / 1M text tokens in, $20 / 1M audio tokens out | OpenAI's named successor of the Speech API models |
+| `--tts openai` | `gpt-4o-mini-tts` | Speech (`/v1/audio/speech`, HTTPS) | $0.60 / 1M text tokens in, $12 / 1M audio tokens out | **Deprecated: shuts down 2027-01-06** (also `tts-1`, `tts-1-hd`) |
+| `--tts openai-realtime` (default) | `gpt-realtime-2.1-mini` | Realtime (WebSocket) | $0.60 / 1M text tokens in, $20 / 1M audio tokens out | OpenAI's named successor of the Speech API models |
 | `--asr openai` (default) | `gpt-transcribe` | Transcription (`/v1/audio/transcriptions`, HTTPS) | $0.0045 / min of audio | Current |
 | `--asr openai-live` | `gpt-live-transcribe` | Realtime transcription (WebSocket) | $0.017 / min of audio sent | Current |
 
-- **`--tts openai-realtime`** uses the Realtime voice model as a read-aloud
+- **`--tts openai-realtime`** (the default) uses the Realtime voice model as a read-aloud
   engine: each utterance is a separate request whose only input is the text,
   under instructions to read it verbatim, once, in its own language, without
   answering or translating it. In our tests it read Japanese and English
   lines word for word, including numbers and questions such as 「今日の天気は？」;
   `-v` logs the model's own transcript of what it said so you can check.
-  `--tts openai` stays the default until you have compared the two voices;
-  switch before 2027-01-06.
+  `--tts openai` (the Speech API) remains selectable but its models shut down
+  on 2027-01-06.
 - **`--asr openai-live`** transcribes while you speak, so the text is ready a
   little sooner after you stop (see below). The bridge's own voice activity detection still
   decides what is sent: nothing is sent until an utterance has 300 ms of
@@ -122,7 +122,7 @@ uv run speech_bridge.py --tts tone --asr keyboard
 Measured from one machine in Japan on 2026-10-26 (the range of the medians of
 three sessions of 3–5 runs each; it varies with the network and OpenAI's load):
 
-| Step | `openai` | `openai-realtime` / `openai-live` |
+| Step | `openai` (REST) | `openai-realtime` / `openai-live` |
 |---|---|---|
 | TTS: request → first audio | 0.6–0.9 s | 0.5–0.85 s |
 | ASR: commit → text, 2 s utterance | 0.6–0.65 s | 0.5 s |
@@ -143,13 +143,13 @@ them again if speech drops out at its start or if you get cut off in a pause.
 | `--rest-port N` | `48000` | Plugin_API REST port (`Plugin_API_Port`) |
 | `--ws-port N` | REST port + 1 | Plugin_API WebSocket port |
 | `--mmdagent-key KEY` | env / `.env` `MMDAGENT_API_KEY` | The engine's `Plugin_API_Key`, when it has one |
-| `--tts openai\|openai-realtime\|tone\|none` | `openai` | Speech synthesis backend (see [Backends and models](#backends-and-models); `none` = do not answer `SYNTH_START`) |
+| `--tts openai\|openai-realtime\|tone\|none` | `openai-realtime` | Speech synthesis backend (see [Backends and models](#backends-and-models); `none` = do not answer `SYNTH_START`) |
 | `--asr openai\|openai-live\|keyboard\|none` | `openai` | Speech recognition backend (`none` = no microphone) |
 | `--lang ja\|en\|auto` | `ja` | Recognition language hint (`auto` = let the model detect it). Synthesis speaks whatever language the text is in. |
 | `--voice NAME` | `marin` | TTS voice used when the script's voice name is not one of the backend's voices |
 | `--instructions TEXT` | none | Tone-of-voice prompt for the TTS model, e.g. `"Speak cheerfully and a little fast."` (`openai-realtime` adds it to its read-aloud instructions) |
 | `--prebuffer-ms MS` | `300` | Audio collected before an utterance starts playing, so playback does not run dry right after it starts (`0` = off; short utterances start when fully synthesized). `150` is enough on a stable network |
-| `--tts-model NAME` | `gpt-4o-mini-tts` / `gpt-realtime-2.1-mini` | OpenAI speech model of `--tts openai` / `openai-realtime` |
+| `--tts-model NAME` | `gpt-realtime-2.1-mini` / `gpt-4o-mini-tts` | OpenAI speech model of `--tts openai-realtime` / `openai` |
 | `--asr-model NAME` | `gpt-transcribe` / `gpt-live-transcribe` | OpenAI transcription model of `--asr openai` / `openai-live` |
 | `--openai-key KEY` | env / `.env` `OPENAI_API_KEY` | OpenAI API key |
 | `--mic DEVICE` | system default | Input device, by index or part of its name |
@@ -174,7 +174,7 @@ and `cedar` for the best quality, and `marin`'s bright voice suits the female
 characters most MMDAgent-EX content uses. OpenAI describes its voices as
 optimized for English; they read Japanese text in Japanese, so listen to a few
 and pick the one you like. Try others with `--voice` (`cedar` is the male
-counterpart). `marin`, `cedar`, `ballad` and `verse` need `gpt-4o-mini-tts`;
+counterpart). With `--tts openai`, `marin`, `cedar`, `ballad` and `verse` need `gpt-4o-mini-tts`;
 with `--tts-model tts-1` pick e.g. `--voice nova`.
 
 `--tts openai-realtime` has `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`,
@@ -287,8 +287,8 @@ while the user speaks derives from `StreamingAsrBackend` and implements
 
 ## Cost and privacy
 
-The OpenAI backends are paid services: synthesis is billed by the amount of
-text and audio, recognition by the length of audio sent (prices above; see
+The OpenAI backends are paid services: synthesis (by default the Realtime
+model `gpt-realtime-2.1-mini`) is billed by the amount of text and audio, recognition by the length of audio sent (prices above; see
 <https://openai.com/api/pricing/> for the current ones). With voice activity
 detection every detected sound longer than 300 ms is sent for transcription,
 so a noisy room costs more; `--ptt` sends only what you choose. `openai-live`

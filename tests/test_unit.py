@@ -249,8 +249,14 @@ def test_cli_defaults(monkeypatch):
     args = sb.build_parser().parse_args([])
     assert (args.host, args.rest_port, args.ws_port) == ("localhost", 48000, None)
     assert args.lang == "ja" and args.voice == sb.DEFAULT_VOICE
-    assert args.tts == "openai" and args.asr == "openai"
+    assert args.tts == "openai-realtime" and args.asr == "openai"
     assert args.silence_ms == 700
+
+
+def test_cli_tts_openai_selects_speech_api():
+    assert sb.build_parser().parse_args(["--tts", "openai"]).tts == "openai"
+    assert sb.TTS_BACKENDS["openai"] is sb.OpenAITts
+    assert sb.TTS_BACKENDS[sb.build_parser().parse_args([]).tts] is sb.OpenAIRealtimeTts
 
 
 @pytest.fixture(autouse=True)

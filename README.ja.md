@@ -89,18 +89,18 @@ uv run speech_bridge.py --tts tone --asr keyboard
 
 | オプション | モデル | OpenAI の API | 料金（2026-10） | 状態 |
 |---|---|---|---|---|
-| `--tts openai`（既定） | `gpt-4o-mini-tts` | Speech（`/v1/audio/speech`、HTTPS） | テキスト入力 100 万トークン $0.60、音声出力 100 万トークン $12 | **非推奨: 2027-01-06 に提供終了**（`tts-1`・`tts-1-hd` も） |
-| `--tts openai-realtime` | `gpt-realtime-2.1-mini` | Realtime（WebSocket） | テキスト入力 100 万トークン $0.60、音声出力 100 万トークン $20 | OpenAI が Speech API のモデルの後継に指定 |
+| `--tts openai` | `gpt-4o-mini-tts` | Speech（`/v1/audio/speech`、HTTPS） | テキスト入力 100 万トークン $0.60、音声出力 100 万トークン $12 | **非推奨: 2027-01-06 に提供終了**（`tts-1`・`tts-1-hd` も） |
+| `--tts openai-realtime`（既定） | `gpt-realtime-2.1-mini` | Realtime（WebSocket） | テキスト入力 100 万トークン $0.60、音声出力 100 万トークン $20 | OpenAI が Speech API のモデルの後継に指定 |
 | `--asr openai`（既定） | `gpt-transcribe` | Transcription（`/v1/audio/transcriptions`、HTTPS） | 音声 1 分 $0.0045 | 現行 |
 | `--asr openai-live` | `gpt-live-transcribe` | Realtime transcription（WebSocket） | 送った音声 1 分 $0.017 | 現行 |
 
-- **`--tts openai-realtime`** は Realtime の音声モデルを読み上げエンジンとして使い
+- **`--tts openai-realtime`**（既定）は Realtime の音声モデルを読み上げエンジンとして使い
   ます。発話ごとにテキストだけを入力とする要求を出し、テキストをその言語のまま
   一字一句 1 回だけ読み、答えたり訳したりしないよう指示しています。私たちの試験
   では、数字や「今日の天気は？」のような問いかけも含め、日本語と英語の文を
   そのとおりに読みました。`-v` を付けるとモデル自身が話した内容の書き起こしが
-  ログに出るので確かめられます。2 つの声を聞き比べるまで既定は `--tts openai` の
-  ままです。2027-01-06 までに切り替えてください。
+  ログに出るので確かめられます。`--tts openai`（Speech API）も選べますが、そのモデルは
+  2027-01-06 に提供終了します。
 - **`--asr openai-live`** は話している間に文字起こしを進めるので、話し終えてから
   テキストが届くまでが少し短くなります（下の表）。何を送るかはブリッジ自身の発話検出（VAD）が
   決めます。発話が 300 ms に達するまでは何も送らず、発話と発話の間の無音は
@@ -118,7 +118,7 @@ uv run speech_bridge.py --tts tone --asr keyboard
 2026-10-26 に日本国内の 1 台から測った値です（3〜5 回ずつ 3 回測った中央値の範囲。
 ネットワークと OpenAI の混み具合で変わります）。
 
-| 区間 | `openai` | `openai-realtime` / `openai-live` |
+| 区間 | `openai`（REST） | `openai-realtime` / `openai-live` |
 |---|---|---|
 | TTS: 要求 → 最初の音声 | 0.6〜0.9 秒 | 0.5〜0.85 秒 |
 | ASR: 確定 → テキスト、2 秒の発話 | 0.6〜0.65 秒 | 0.5 秒 |
@@ -139,13 +139,13 @@ VAD が `--silence-ms` の無音を待ってから決まり、TTS は再生開�
 | `--rest-port N` | `48000` | Plugin_API の REST ポート（`Plugin_API_Port`） |
 | `--ws-port N` | REST ポート + 1 | Plugin_API の WebSocket ポート |
 | `--mmdagent-key KEY` | 環境変数 / `.env` の `MMDAGENT_API_KEY` | エンジンに `Plugin_API_Key` が設定されている場合のキー |
-| `--tts openai\|openai-realtime\|tone\|none` | `openai` | 音声合成バックエンド（[バックエンドとモデル](#バックエンドとモデル)を参照。`none` = `SYNTH_START` に応答しない） |
+| `--tts openai\|openai-realtime\|tone\|none` | `openai-realtime` | 音声合成バックエンド（[バックエンドとモデル](#バックエンドとモデル)を参照。`none` = `SYNTH_START` に応答しない） |
 | `--asr openai\|openai-live\|keyboard\|none` | `openai` | 音声認識バックエンド（`none` = マイクを使わない） |
 | `--lang ja\|en\|auto` | `ja` | 認識の言語ヒント（`auto` = モデルが判定）。合成はテキストの言語でそのまま話します |
 | `--voice NAME` | `marin` | スクリプトの声の名前がバックエンドの声にないときに使う TTS の声 |
 | `--instructions TEXT` | なし | TTS モデルへの話し方の指示。例: `"明るく、少し早口で話してください。"`（`openai-realtime` では読み上げの指示に付け足します） |
 | `--prebuffer-ms MS` | `300` | 発話の再生を始める前にためておく音声の長さ。再生開始直後に音が途切れるのを防ぎます（`0` = 無効。短い発話は合成が終わった時点で再生を始めます）。ネットワークが安定していれば `150` で足ります |
-| `--tts-model NAME` | `gpt-4o-mini-tts` / `gpt-realtime-2.1-mini` | `--tts openai` / `openai-realtime` の OpenAI 音声合成モデル |
+| `--tts-model NAME` | `gpt-realtime-2.1-mini` / `gpt-4o-mini-tts` | `--tts openai-realtime` / `openai` の OpenAI 音声合成モデル |
 | `--asr-model NAME` | `gpt-transcribe` / `gpt-live-transcribe` | `--asr openai` / `openai-live` の OpenAI 文字起こしモデル |
 | `--openai-key KEY` | 環境変数 / `.env` の `OPENAI_API_KEY` | OpenAI の API キー |
 | `--mic DEVICE` | システム既定 | 入力デバイス（番号または名前の一部） |
@@ -169,8 +169,8 @@ VAD が `--silence-ms` の無音を待ってから決まり、TTS は再生開�
 `cedar` を推奨しており、`marin` の明るい声が MMDAgent-EX のコンテンツに多い女性
 キャラクターに合うためです。OpenAI は各声を英語向けに最適化したものとしており、
 日本語のテキストも日本語で読みます。いくつか聞き比べて選んでください。ほかの声は
-`--voice` で試せます（`cedar` は男性の声）。`marin`・`cedar`・`ballad`・`verse` は
-`gpt-4o-mini-tts` 専用です。`--tts-model tts-1` では `--voice nova` などを選んで
+`--voice` で試せます（`cedar` は男性の声）。`--tts openai` では `marin`・`cedar`・
+`ballad`・`verse` は `gpt-4o-mini-tts` 専用です。`--tts-model tts-1` では `--voice nova` などを選んで
 ください。
 
 `--tts openai-realtime` の声は `alloy`・`ash`・`ballad`・`coral`・`echo`・`sage`・
@@ -284,7 +284,8 @@ ASR_BACKENDS["myasr"] = MyAsr
 
 ## 料金とプライバシー
 
-OpenAI のバックエンドは有料サービスです。合成はテキストと音声の量、認識は送った
+OpenAI のバックエンドは有料サービスです。合成（既定は Realtime の
+`gpt-realtime-2.1-mini`）はテキストと音声の量、認識は送った
 音声の長さで課金されます（料金は上の表。最新の料金は
 <https://openai.com/api/pricing/> を見てください）。発話検出（VAD）では 300 ms を
 超えて検出した音をすべて文字起こしに送るので、騒がしい部屋ほど費用がかかります。
