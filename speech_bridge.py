@@ -66,7 +66,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import websockets
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 log = logging.getLogger("speech_bridge")
 
@@ -1253,6 +1253,8 @@ class OpenAIRealtimeTts(TtsBackend):
     # session thread
     def _create(self, req: RealtimeRequest) -> None:
         self.router.add(req)
+        # Out-of-band responses do not take the session's reasoning setting (first audio
+        # came ~0.3 s later without it), so it is repeated here with the instructions.
         response = {
             "conversation": "none", "output_modalities": ["audio"],
             "metadata": {"bridge": req.key}, "reasoning": {"effort": "minimal"},
@@ -2308,7 +2310,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "models OpenAI shuts down on 2027-01-06; openai-realtime is its "
                         "successor)")
     g.add_argument("--asr", choices=[*ASR_BACKENDS, "none"], default="openai",
-                   help="speech recognition backend (default openai)")
+                   help="speech recognition backend (default openai = one transcription request "
+                        "per utterance; openai-live streams each utterance while you speak)")
     g.add_argument("--lang", choices=["ja", "en", "auto"], default="ja",
                    help="recognition language hint (default ja; auto = no hint)")
     g.add_argument("--voice", default=DEFAULT_VOICE,

@@ -24,8 +24,9 @@ import speech_bridge as sb
 
 pytestmark = pytest.mark.requires_openai
 
-sb.load_dotenv(sb.dotenv_paths(), os.environ)
-KEY = os.environ.get("OPENAI_API_KEY", "")
+_env = dict(os.environ)                    # a copy: collecting this file must not change the
+sb.load_dotenv(sb.dotenv_paths(), _env)    # environment the unit tests run in
+KEY = _env.get("OPENAI_API_KEY", "")
 if not KEY:
     pytest.skip("OPENAI_API_KEY is not set", allow_module_level=True)
 
