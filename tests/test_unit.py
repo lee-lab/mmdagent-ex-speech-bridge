@@ -646,3 +646,59 @@ def test_main_reads_key_from_dotenv_without_logging_it(tmp_path, monkeypatch, ca
         sb.main([])
     assert seen["key"] == "sk-secret-value"
     assert "sk-secret-value" not in caplog.text
+
+
+# ----- OpenAI REST backends: language hint, keep-alive, warm-up -----
+
+@pytest.mark.parametrize("model,lang,expected", [
+    ("gpt-transcribe", "ja", {"extra_body": {"languages": ["ja"]}}),
+    ("gpt-live-transcribe", "en", {"extra_body": {"languages": ["en"]}}),
+    ("gpt-4o-mini-transcribe", "ja", {"language": "ja"}),
+    ("whisper-1", "en", {"language": "en"}),
+    ("gpt-transcribe", None, {}),
+])
+def test_transcription_language_args(model, lang, expected):
+    assert sb.transcription_language_args(model, lang) == expected
+
+
+def test_cli_model_defaults_are_resolved_by_the_backend():
+    args = sb.build_parser().parse_args([])
+    assert args.tts_model is None and args.asr_model is None
+    args.openai_key = "sk-test"
+    assert sb.OpenAIAsr(args).model == sb.DEFAULT_ASR_MODEL == "gpt-transcribe"
+    assert sb.OpenAITts(args).model == sb.DEFAULT_TTS_MODEL
+    args.asr_model = "whisper-1"
+    assert sb.OpenAIAsr(args).model == "whisper-1"
+
+
+def test_rest_clients_keep_connections_alive_and_are_separate():
+    import openai
+    hc = sb._keepalive_http_client(openai)
+    assert hc is not None
+    pool = getattr(getattr(hc, "_transport", None), "_pool", None)
+    if pool is not None and hasattr(pool, "_keepalive_expiry"):
+        assert pool._keepalive_expiry == sb.HTTP_KEEPALIVE_S
+    args = types.SimpleNamespace(openai_key="sk-test", tts_model=None, asr_model=None)
+    assert sb.OpenAITts(args).client is not sb.OpenAIAsr(args).client
+
+
+def test_prepare_warms_only_an_idle_backend(monkeypatch):
+    args = types.SimpleNamespace(openai_key="sk-test", asr_model=None)
+    asr = sb.OpenAIAsr(args)
+    warmed = []
+    monkeypatch.setattr(asr, "_warm", lambda startup: warmed.append(startup))
+
+    class SyncThread:
+        def __init__(self, target, args=(), **kw):
+            self.target, self.args = target, args
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(sb.threading, "Thread", SyncThread)
+    asr._last_use = sb.time.monotonic()
+    asr.prepare()
+    assert warmed == []
+    asr._last_use -= sb.WARM_AFTER_IDLE_S + 1
+    asr.prepare()
+    assert warmed == [False]

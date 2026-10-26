@@ -84,6 +84,13 @@ MIC_FRAME_MS = 20
 MAX_RECOG_CHARS = 500            # keep bus messages well under the engine's buffer size
 STATUS_TIMEOUT_S = 5.0
 REPLAY_WINDOW_MS = 5000          # = the Lua runtime's wait for SYNTH_EVENT_START
+HTTP_KEEPALIVE_S = 300.0         # idle HTTPS connections kept (the SDK default of 5 s closes
+                                 # them between dialogue turns: a new TCP+TLS connect each time)
+WARM_AFTER_IDLE_S = 240.0        # after this much idleness the REST connection is re-opened when
+                                 # speech starts (the server kept idle ones for >= 240 s)
+
+DEFAULT_TTS_MODEL = "gpt-4o-mini-tts"
+DEFAULT_ASR_MODEL = "gpt-transcribe"
 
 # Plugin_API binary stream header (dev/plugin-api-audio-playback.md §5.2)
 STREAM_HEADER = struct.Struct("<BBBBII")
@@ -272,6 +279,20 @@ def short(text: str, n: int = 40) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+def transcription_language_args(model: str, lang: str | None) -> dict:
+    """Language hint for /v1/audio/transcriptions.
+
+    gpt-transcribe takes a list ('languages'; sending 'language' too is an
+    error); the older models take a single 'language'. The list goes through
+    extra_body so that SDK versions without the parameter can send it.
+    """
+    if not lang:
+        return {}
+    if model.startswith(("gpt-transcribe", "gpt-live-transcribe")):
+        return {"extra_body": {"languages": [lang]}}
+    return {"language": lang}
+
+
 # ---------------------------------------------------------------------------
 # .env files (pure parser, unit-tested)
 # ---------------------------------------------------------------------------
@@ -354,6 +375,12 @@ class TtsBackend(abc.ABC):
     def synthesize(self, text: str, voice: str) -> Iterator[bytes]:
         """Yield audio chunks as soon as they are available (any length)."""
 
+    def start(self) -> None:
+        """Called once before the first request: connect / warm up (must not block)."""
+
+    def prepare(self) -> None:
+        """A request is probably coming soon (the user started speaking); must not block."""
+
     def describe(self) -> str:
         return type(self).__name__
 
@@ -370,37 +397,118 @@ class AsrBackend(abc.ABC):
     def transcribe(self, wav: bytes, lang: str | None) -> str:
         """Return the text of a 16 kHz mono 16-bit WAV file (lang None = auto)."""
 
+    def start(self) -> None:
+        """Called once before the first request: connect / warm up (must not block)."""
+
+    def prepare(self) -> None:
+        """A request is probably coming soon (the user started speaking); must not block."""
+
     def describe(self) -> str:
         return type(self).__name__
 
 
+def _keepalive_http_client(openai):
+    """The SDK's default HTTP client, keeping idle connections for HTTP_KEEPALIVE_S.
+
+    The SDK is built on httpx (openai 1.x / 2.x) or httpx2 (3.x); the Limits
+    class is taken from whichever module its client class comes from.
+    """
+    try:
+        cls = openai.DefaultHttpxClient
+        mod = next(sys.modules[c.__module__.split(".")[0]] for c in cls.__mro__
+                   if c.__name__ == "Client" and c.__module__.split(".")[0] in ("httpx", "httpx2"))
+        return cls(limits=mod.Limits(max_connections=20, max_keepalive_connections=5,
+                                     keepalive_expiry=HTTP_KEEPALIVE_S))
+    except Exception as e:       # an SDK shape we do not know: keep its defaults
+        log.debug("keep-alive HTTP client unavailable (%s); using the SDK default", e)
+        return None
+
+
 def make_openai_client(args: argparse.Namespace):
+    """A client with its own connection pool (one per backend: TTS and ASR never evict
+    each other's keep-alive connection)."""
     try:
         import openai
     except ImportError as e:
         raise FatalError("the 'openai' package is missing: pip install -r requirements.txt") from e
-    return openai.OpenAI(api_key=args.openai_key, timeout=30.0, max_retries=1)
+    http_client = _keepalive_http_client(openai)
+    kwargs = {"http_client": http_client} if http_client is not None else {}
+    return openai.OpenAI(api_key=args.openai_key, timeout=30.0, max_retries=1, **kwargs)
 
 
-class OpenAITts(TtsBackend):
-    """OpenAI speech API, streamed as raw 24 kHz PCM."""
+def is_key_error(e: BaseException) -> bool:
+    return type(e).__name__ in ("AuthenticationError", "PermissionDeniedError")
+
+
+class OpenAIRestBackend:
+    """Shared by the REST backends: keep the HTTPS connection open and warm."""
+
+    tag = ""
+
+    def _init_rest(self, args: argparse.Namespace, model: str) -> None:
+        self.client = make_openai_client(args)
+        self.model = model
+        self._last_use = 0.0
+        self._warming = threading.Lock()
+
+    def _used(self) -> None:
+        self._last_use = time.monotonic()
+
+    def _warm(self, startup: bool) -> None:
+        """Open the connection with a free request (also checks the key and the model)."""
+        if not self._warming.acquire(blocking=False):
+            return
+        try:
+            self._used()
+            self.client.models.retrieve(self.model)
+        except Exception as e:
+            name = type(e).__name__
+            if is_key_error(e):
+                log.error("[%s] the OpenAI API rejected the key (%s): %s", self.tag, name, KEY_HINT)
+            elif name == "NotFoundError" and startup:
+                log.warning("[%s] model '%s' is not available to this API key", self.tag,
+                            self.model)
+            else:
+                log.debug("[%s] warm-up failed: %s: %s", self.tag, name, e)
+        finally:
+            self._warming.release()
+
+    def start(self) -> None:
+        threading.Thread(target=self._warm, args=(True,), name=f"warm-{self.tag}",
+                         daemon=True).start()
+
+    def prepare(self) -> None:
+        if time.monotonic() - self._last_use > WARM_AFTER_IDLE_S:
+            threading.Thread(target=self._warm, args=(False,), name=f"warm-{self.tag}",
+                             daemon=True).start()
+
+
+class OpenAITts(OpenAIRestBackend, TtsBackend):
+    """OpenAI speech API (/v1/audio/speech), streamed as raw 24 kHz PCM.
+
+    Deprecated by OpenAI: its models shut down on 2027-01-06; the successor is
+    the openai-realtime backend.
+    """
 
     voices = OPENAI_VOICES
+    tag = "tts"
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__(args)
-        self.client = make_openai_client(args)
+        self._init_rest(args, getattr(args, "tts_model", None) or DEFAULT_TTS_MODEL)
 
     def synthesize(self, text: str, voice: str) -> Iterator[bytes]:
-        kwargs = {"model": self.args.tts_model, "voice": voice, "input": text[:4096],
+        kwargs = {"model": self.model, "voice": voice, "input": text[:4096],
                   "response_format": "pcm"}
         if self.args.instructions:
             kwargs["instructions"] = self.args.instructions
+        self._used()
         with self.client.audio.speech.with_streaming_response.create(**kwargs) as resp:
             yield from resp.iter_bytes(MAX_CHUNK_BYTES)
+        self._used()
 
     def describe(self) -> str:
-        return f"openai ({self.args.tts_model}, voice {self.args.voice})"
+        return f"openai ({self.model}, voice {self.args.voice})"
 
 
 class ToneTts(TtsBackend):
@@ -425,21 +533,27 @@ class ToneTts(TtsBackend):
         return "tone (offline beep)"
 
 
-class OpenAIAsr(AsrBackend):
-    """OpenAI transcription API."""
+class OpenAIAsr(OpenAIRestBackend, AsrBackend):
+    """OpenAI transcription API (/v1/audio/transcriptions), one request per utterance."""
+
+    tag = "asr"
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__(args)
-        self.client = make_openai_client(args)
+        self._init_rest(args, getattr(args, "asr_model", None) or DEFAULT_ASR_MODEL)
 
     def transcribe(self, wav: bytes, lang: str | None) -> str:
-        kwargs = {"language": lang} if lang else {}
-        result = self.client.audio.transcriptions.create(
-            model=self.args.asr_model, file=("speech.wav", wav, "audio/wav"), **kwargs)
+        self._used()
+        try:
+            result = self.client.audio.transcriptions.create(
+                model=self.model, file=("speech.wav", wav, "audio/wav"),
+                **transcription_language_args(self.model, lang))
+        finally:
+            self._used()
         return getattr(result, "text", "") or ""
 
     def describe(self) -> str:
-        return f"openai ({self.args.asr_model}, lang {self.args.lang})"
+        return f"openai ({self.model}, lang {self.args.lang})"
 
 
 class KeyboardAsr(AsrBackend):
@@ -1067,7 +1181,7 @@ class Bridge:
 
     def _log_tts_error(self, e: Exception) -> None:
         name = type(e).__name__
-        if name in ("AuthenticationError", "PermissionDeniedError"):
+        if is_key_error(e):
             log.error("[tts] the OpenAI API rejected the key (%s): %s", name, KEY_HINT)
         else:
             log.error("[tts] synthesis failed: %s: %s", name, e)
@@ -1136,6 +1250,12 @@ class MicListener:
     def _gated(self) -> bool:
         return not self.args.full_duplex and self.bridge.mic_blocked()
 
+    def _speech_started(self) -> None:
+        self.bridge.emit_threadsafe("RECOG_EVENT_START", "")
+        self.asr.prepare()                   # an idle REST connection re-opens meanwhile
+        if self.bridge.tts is not None:
+            self.bridge.tts.prepare()        # the reply will need it next
+
     def _open(self, sd):
         device = find_mic(sd, self.args.mic)
         block = MIC_RATE * MIC_FRAME_MS // 1000
@@ -1197,7 +1317,7 @@ class MicListener:
             for ev in vad.process(frame, gated=self._gated()):
                 if ev.kind == "start":
                     log.debug("[asr] speech started")
-                    self.bridge.emit_threadsafe("RECOG_EVENT_START", "")
+                    self._speech_started()
                 elif ev.kind == "end":
                     self.worker.submit(self._transcribe, ev.audio)
                 else:
@@ -1217,7 +1337,7 @@ class MicListener:
                 recording = not recording
                 if recording:
                     buf.clear()
-                    self.bridge.emit_threadsafe("RECOG_EVENT_START", "")
+                    self._speech_started()
                     print("[asr] recording... press Enter to stop", flush=True)
                 else:
                     if len(buf) >= MIC_RATE * 2 * 3 // 10:                  # >= 300 ms
@@ -1241,7 +1361,7 @@ class MicListener:
         try:
             text = sanitize_recog_text(self.asr.transcribe(pcm_to_wav(pcm), self.lang))
         except Exception as e:
-            if type(e).__name__ in ("AuthenticationError", "PermissionDeniedError"):
+            if is_key_error(e):
                 log.error("[asr] the OpenAI API rejected the key: %s", KEY_HINT)
             else:
                 log.error("[asr] transcription failed: %s: %s", type(e).__name__, e)
@@ -1295,9 +1415,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--prebuffer-ms", type=int, default=DEFAULT_PREBUFFER_MS, metavar="MS",
                    help="audio collected before an utterance starts playing, against dropouts "
                         f"(default {DEFAULT_PREBUFFER_MS}; 0 = off)")
-    g.add_argument("--tts-model", default="gpt-4o-mini-tts", help="default gpt-4o-mini-tts")
-    g.add_argument("--asr-model", default="gpt-4o-mini-transcribe",
-                   help="default gpt-4o-mini-transcribe")
+    g.add_argument("--tts-model", default=None, help=f"default {DEFAULT_TTS_MODEL}")
+    g.add_argument("--asr-model", default=None, help=f"default {DEFAULT_ASR_MODEL}")
     g.add_argument("--openai-key", default=os.environ.get("OPENAI_API_KEY") or None,
                    help="OpenAI API key (env OPENAI_API_KEY, or a .env file)")
     g = p.add_argument_group("microphone")
@@ -1374,6 +1493,9 @@ def main(argv: list[str] | None = None) -> int:
                         args.voice, args.tts)
         bridge = Bridge(args, tts)
         print_banner(args, tts, asr)
+        for backend in (tts, asr):
+            if backend is not None:
+                backend.start()
         if asr is not None:
             def start_input() -> None:
                 if asr.needs_microphone:
