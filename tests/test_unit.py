@@ -223,7 +223,7 @@ def test_fallback_deadline_slow_synthesis():
 
 def test_backend_registry():
     assert set(sb.TTS_BACKENDS) == {"openai", "tone"}
-    assert set(sb.ASR_BACKENDS) == {"openai", "keyboard"}
+    assert set(sb.ASR_BACKENDS) == {"openai", "openai-live", "keyboard"}
     for cls in sb.TTS_BACKENDS.values():
         assert issubclass(cls, sb.TtsBackend)
     for cls in sb.ASR_BACKENDS.values():
@@ -231,7 +231,8 @@ def test_backend_registry():
     assert sb.KeyboardAsr.needs_microphone is False
     choices = {a.dest: a.choices for a in sb.build_parser()._actions if a.choices}
     assert choices["tts"] == ["openai", "tone", "none"]
-    assert choices["asr"] == ["openai", "keyboard", "none"]
+    assert choices["asr"] == ["openai", "openai-live", "keyboard", "none"]
+    assert sb.OpenAILiveAsr.streaming and not sb.OpenAIAsr.streaming
 
 
 @pytest.mark.parametrize("text,seconds", [("", 0.5), ("あ" * 20, 1.2), ("a" * 500, 6.0)])
@@ -702,3 +703,290 @@ def test_prepare_warms_only_an_idle_backend(monkeypatch):
     asr._last_use -= sb.WARM_AFTER_IDLE_S + 1
     asr.prepare()
     assert warmed == [False]
+
+
+# ----- resampler -----
+
+def test_resampler_rate_and_continuity():
+    x = (np.sin(np.arange(16000) / 7.0) * 8000).astype("<i2").tobytes()
+    whole = sb.LinearResampler(16000, 24000).process(x)
+    assert abs(len(whole) // 2 - 24000) <= 1
+    r = sb.LinearResampler(16000, 24000)
+    pieces = b"".join(r.process(x[i:i + 640]) for i in range(0, len(x), 640))
+    assert pieces == whole                       # chunking does not change the output
+
+
+def test_resampler_odd_chunks_and_reset():
+    r = sb.LinearResampler(16000, 24000)
+    assert r.process(b"") == b""
+    out = r.process(np.full(320, 1000, "<i2").tobytes())
+    assert set(np.frombuffer(out, "<i2")) == {1000}
+    r.reset()
+    assert len(r.process(np.zeros(2, "<i2").tobytes())) // 2 == 2      # t = 0, 0.667
+
+
+# ----- VAD-gated streaming (what goes to a streaming recognizer) -----
+
+def run_streamer(frames, gated_at=None, **kw):
+    vad = calibrated_vad(**kw)
+    st = sb.VadStreamer(vad)
+    actions = []
+    for i, f in enumerate(frames):
+        actions += st.process(f, gated=gated_at is not None and i >= gated_at)
+    return st, actions
+
+
+def kinds(actions):
+    return [a.kind for a in actions]
+
+
+def test_streamer_never_sends_silence():
+    st, actions = run_streamer([QUIET] * 500)
+    assert actions == [] and st.bytes_appended == 0
+
+
+def test_streamer_holds_until_min_speech_then_streams_and_commits():
+    vad_kw = {"silence_ms": 200}
+    st, actions = run_streamer([LOUD] * 50 + [QUIET] * 30, **vad_kw)
+    k = kinds(actions)
+    assert k[0] == "start" and k[-1] == "commit" and k.count("commit") == 1
+    first_append = k.index("append")
+    # nothing went out before 300 ms of voiced audio (15 frames after the 3-frame onset)
+    assert first_append >= 1 and len(actions[first_append].audio) >= 15 * len(LOUD)
+    sent = b"".join(a.audio for a in actions if a.kind == "append")
+    # = the segment the REST path would upload: pre-roll + speech + 300 ms tail
+    vad = calibrated_vad(**vad_kw)
+    rest = [e for f in [LOUD] * 50 + [QUIET] * 30 for e in vad.process(f) if e.kind == "end"]
+    assert sent == rest[0].audio and st.bytes_appended == len(sent)
+    assert actions[-1].seconds == pytest.approx(len(sent) / 2 / sb.MIC_RATE)
+    # streaming: most of the audio went out before the commit's frame
+    assert len(sent) - len(actions[-2].audio if actions[-2].kind == "append" else b"") > \
+        len(sent) // 2
+
+
+def test_streamer_short_segment_sends_nothing():
+    st, actions = run_streamer([LOUD] * 8 + [QUIET] * 60)
+    assert kinds(actions) == ["start", "drop"] and actions[-1].reason == "short"
+    assert st.bytes_appended == 0
+
+
+def test_streamer_pause_is_sent_only_when_speech_resumes():
+    frames = [LOUD] * 30 + [QUIET] * 25 + [LOUD] * 20 + [QUIET] * 40      # 500 ms pause
+    _st, actions = run_streamer(frames, silence_ms=700)
+    assert kinds(actions).count("commit") == 1
+    vad = calibrated_vad(silence_ms=700)
+    rest = [e for f in frames for e in vad.process(f) if e.kind == "end"]
+    assert b"".join(a.audio for a in actions if a.kind == "append") == rest[0].audio
+
+
+def test_streamer_gate_after_sending_clears():
+    _st, actions = run_streamer([LOUD] * 40 + [LOUD] * 5, gated_at=40)
+    assert kinds(actions)[-2:] == ["clear", "drop"] and actions[-1].reason == "gated"
+
+
+def test_streamer_gate_before_sending_needs_no_clear():
+    _st, actions = run_streamer([LOUD] * 10 + [LOUD] * 5, gated_at=10)
+    assert kinds(actions) == ["start", "drop"]
+
+
+# ----- live transcription bookkeeping -----
+
+def test_live_turns_out_of_order_completion():
+    import concurrent.futures as cf
+    lt = sb.LiveTurns()
+    f1, f2 = cf.Future(), cf.Future()
+    lt.append("a")
+    t1 = lt.commit(f1)
+    lt.append("b")
+    t2 = lt.commit(f2)
+    assert (t1.event_id, t2.event_id) == ("commit_1", "commit_2")
+    lt.on_committed("item_1", None)
+    lt.on_committed("item_2", "item_1")
+    lt.on_delta("item_2", "wor")
+    assert lt.on_completed("item_2", "world") is t2
+    assert f2.result(0) == "world" and not f1.done()
+    lt.on_completed("item_1", "hello")
+    assert f1.result(0) == "hello" and lt.idle()
+
+
+def test_live_turns_empty_commit_and_rejected_commit():
+    import concurrent.futures as cf
+    lt = sb.LiveTurns()
+    f0 = cf.Future()
+    assert lt.commit(f0) is None and f0.result(0) == ""
+    f1, f2 = cf.Future(), cf.Future()
+    lt.append("a")
+    lt.commit(f1)
+    lt.append("b")
+    lt.commit(f2)
+    assert lt.on_error("commit_1", "buffer too small") is not None
+    with pytest.raises(RuntimeError):
+        f1.result(0)
+    lt.on_committed("item_9")                     # belongs to the second commit
+    lt.on_completed("item_9", "second")
+    assert f2.result(0) == "second"
+
+
+def test_live_turns_transcript_before_committed_event():
+    import concurrent.futures as cf
+    lt = sb.LiveTurns()
+    f = cf.Future()
+    lt.append("a")
+    lt.commit(f)
+    assert lt.on_completed("item_1", "early") is None
+    lt.on_committed("item_1")
+    assert f.result(0) == "early"
+
+
+def test_live_turns_resend_after_reconnect():
+    import concurrent.futures as cf
+    lt = sb.LiveTurns()
+    f1, f2 = cf.Future(), cf.Future()
+    lt.append("a1")
+    lt.append("a2")
+    lt.commit(f1)
+    lt.on_committed("item_1")
+    lt.append("b1")
+    lt.commit(f2)
+    f2.cancel()                                   # the listener gave up on it
+    lt.append("c1")                               # the turn being spoken
+    out = lt.resend()
+    assert [(chunks, t is not None) for chunks, t in out] == [(["a1", "a2"], True), (["c1"], False)]
+    lt.on_committed("item_7")
+    lt.on_completed("item_7", "again")
+    assert f1.result(0) == "again"
+
+
+def test_resolve_future_ignores_cancelled():
+    import concurrent.futures as cf
+    f = cf.Future()
+    f.cancel()
+    sb.resolve_future(f, "late")                  # no InvalidStateError
+    assert f.cancelled()
+
+
+class FakeRealtime:
+    """Stands in for RealtimeSession: runs calls inline and records what is sent."""
+
+    def __init__(self, connected=True):
+        self.sent = []
+        self.connected = connected
+        self.fatal = None
+
+    def call(self, fn, *args):
+        fn(*args)
+
+    def send(self, event):
+        if not self.connected:
+            return False
+        self.sent.append(event)
+        return True
+
+    def types(self):
+        return [e["type"] for e in self.sent]
+
+
+def make_live_asr(lang="ja"):
+    args = types.SimpleNamespace(openai_key="sk-test", asr_model=None, lang=lang)
+    asr = sb.OpenAILiveAsr(args)
+    asr.rt = FakeRealtime()
+    return asr
+
+
+def test_live_asr_session_config():
+    asr = sb.OpenAILiveAsr(types.SimpleNamespace(openai_key="k", asr_model=None, lang="ja"))
+    cfg = asr.rt.session
+    assert cfg["type"] == "transcription"
+    inp = cfg["audio"]["input"]
+    assert inp["format"] == {"type": "audio/pcm", "rate": 24000}
+    assert inp["transcription"] == {"model": "gpt-live-transcribe", "languages": ["ja"]}
+    assert "turn_detection" in inp and inp["turn_detection"] is None
+    assert asr.rt.url.endswith("/v1/realtime?intent=transcription")
+    auto = sb.OpenAILiveAsr(types.SimpleNamespace(openai_key="k", asr_model=None, lang="auto"))
+    assert auto.rt.session["audio"]["input"]["transcription"] == {"model": "gpt-live-transcribe"}
+
+
+def test_live_asr_append_commit_and_result():
+    asr = make_live_asr()
+    asr.append(LOUD)
+    asr.append(LOUD)
+    fut = asr.commit()
+    assert asr.rt.types() == ["input_audio_buffer.append"] * 2 + ["input_audio_buffer.commit"]
+    audio = b"".join(sb.base64.b64decode(e["audio"]) for e in asr.rt.sent[:2])
+    assert abs(len(audio) // 2 - 2 * 480) <= 1                 # 2 x 20 ms at 24 kHz
+    assert asr.audio_bytes_sent == len(audio)
+    commit = asr.rt.sent[-1]
+    asr._on_event({"type": "input_audio_buffer.committed", "item_id": "it1",
+                   "previous_item_id": None})
+    asr._on_event({"type": "conversation.item.input_audio_transcription.delta",
+                   "item_id": "it1", "delta": "こん"})
+    asr._on_event({"type": "conversation.item.input_audio_transcription.completed",
+                   "item_id": "it1", "transcript": "こんにちは"})
+    assert fut.result(0) == "こんにちは" and commit["event_id"] == "commit_1"
+
+
+def test_live_asr_clear_and_rejected_commit():
+    asr = make_live_asr()
+    asr.clear()
+    assert asr.rt.sent == []                                   # nothing open: nothing to clear
+    asr.append(LOUD)
+    asr.clear()
+    assert asr.rt.types()[-1] == "input_audio_buffer.clear"
+    asr.append(LOUD)
+    fut = asr.commit()
+    asr._on_event({"type": "error", "event_id": "srv_1",
+                   "error": {"message": "buffer too small", "event_id": "commit_1"}})
+    with pytest.raises(RuntimeError, match="too small"):
+        fut.result(0)
+
+
+def test_live_asr_reconnect_resends_unfinished_turn():
+    asr = make_live_asr()
+    asr.rt.connected = False                                   # offline while speaking
+    asr.append(LOUD)
+    fut = asr.commit()
+    assert asr.rt.sent == [] and not fut.done()
+    asr.rt.connected = True
+    asr._on_open()
+    assert asr.rt.types() == ["input_audio_buffer.append", "input_audio_buffer.commit"]
+    asr._on_event({"type": "input_audio_buffer.committed", "item_id": "x"})
+    asr._on_event({"type": "conversation.item.input_audio_transcription.completed",
+                   "item_id": "x", "transcript": "ok"})
+    assert fut.result(0) == "ok"
+
+
+class FakeBridge:
+    def __init__(self):
+        self.emitted = []
+        self.tts = None
+
+    def mic_blocked(self):
+        return False
+
+    def emit_threadsafe(self, mtype, args):
+        self.emitted.append((mtype, args))
+
+
+def test_mic_listener_streams_through_live_backend():
+    """The VAD loop with a streaming backend: start, audio, commit, RECOG_EVENT_STOP."""
+    import threading
+    asr = make_live_asr()
+    bridge = FakeBridge()
+    args = types.SimpleNamespace(mic=None, lang="ja", full_duplex=False, ptt=False,
+                                 vad_threshold=None, silence_ms=200)
+    mic = sb.MicListener(bridge, asr, args)
+    frames = [QUIET] * 50 + [LOUD] * 40 + [QUIET] * 30 + [QUIET] * 100
+    for f in frames:
+        mic.frames.put(f)
+    threading.Thread(target=mic._vad_loop, daemon=True).start()
+    deadline = sb.time.monotonic() + 5
+    while "input_audio_buffer.commit" not in asr.rt.types() and sb.time.monotonic() < deadline:
+        sb.time.sleep(0.01)
+    assert asr.rt.types().count("input_audio_buffer.commit") == 1
+    asr._on_event({"type": "input_audio_buffer.committed", "item_id": "i"})
+    asr._on_event({"type": "conversation.item.input_audio_transcription.completed",
+                   "item_id": "i", "transcript": "テスト|です"})
+    while len(bridge.emitted) < 2 and sb.time.monotonic() < deadline:
+        sb.time.sleep(0.01)
+    assert bridge.emitted == [("RECOG_EVENT_START", ""), ("RECOG_EVENT_STOP", "テスト です")]
+    assert mic.streamer.bytes_appended > 0

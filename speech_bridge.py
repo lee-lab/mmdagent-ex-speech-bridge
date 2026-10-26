@@ -40,6 +40,7 @@ from __future__ import annotations
 import abc
 import argparse
 import asyncio
+import base64
 import collections
 import concurrent.futures
 import contextlib
@@ -91,6 +92,16 @@ WARM_AFTER_IDLE_S = 240.0        # after this much idleness the REST connection 
 
 DEFAULT_TTS_MODEL = "gpt-4o-mini-tts"
 DEFAULT_ASR_MODEL = "gpt-transcribe"
+DEFAULT_LIVE_ASR_MODEL = "gpt-live-transcribe"
+
+# OpenAI Realtime API (WebSocket)
+OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
+REALTIME_RATE = 24000            # the only PCM rate the Realtime API takes and gives
+REALTIME_OPEN_TIMEOUT_S = 10.0   # connect + session.update -> session.updated
+REALTIME_MAX_AGE_S = 55 * 60     # sessions end after 60 min; renew (while idle) before that
+REALTIME_RENEW_CHECK_S = 15.0
+REALTIME_BACKOFF_MAX_S = 5.0
+LIVE_COMMIT_TIMEOUT_S = 15.0     # commit -> final transcript
 
 # Plugin_API binary stream header (dev/plugin-api-audio-playback.md §5.2)
 STREAM_HEADER = struct.Struct("<BBBBII")
@@ -279,18 +290,55 @@ def short(text: str, n: int = 40) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
-def transcription_language_args(model: str, lang: str | None) -> dict:
-    """Language hint for /v1/audio/transcriptions.
-
-    gpt-transcribe takes a list ('languages'; sending 'language' too is an
-    error); the older models take a single 'language'. The list goes through
-    extra_body so that SDK versions without the parameter can send it.
-    """
+def language_field(model: str, lang: str | None) -> dict:
+    """The language hint a transcription model takes: gpt-transcribe and
+    gpt-live-transcribe a list ('languages'; sending 'language' too is an
+    error), the older models a single 'language'."""
     if not lang:
         return {}
     if model.startswith(("gpt-transcribe", "gpt-live-transcribe")):
-        return {"extra_body": {"languages": [lang]}}
+        return {"languages": [lang]}
     return {"language": lang}
+
+
+def transcription_language_args(model: str, lang: str | None) -> dict:
+    """Language hint for /v1/audio/transcriptions.
+
+    The 'languages' list goes through extra_body so that SDK versions without
+    the parameter can send it.
+    """
+    field_ = language_field(model, lang)
+    return {"extra_body": field_} if "languages" in field_ else field_
+
+
+class LinearResampler:
+    """Streaming linear-interpolation resampler for mono PCM16LE.
+
+    Chunks may have any length; the output of consecutive chunks equals the
+    output of their concatenation. Good enough for speech recognition input.
+    """
+
+    def __init__(self, rate_in: int, rate_out: int) -> None:
+        self.step = rate_in / rate_out
+        self.reset()
+
+    def reset(self) -> None:
+        self._last: float | None = None     # last input sample of the previous chunk
+        self._pos = 0.0                     # next output position, in input samples from _last
+
+    def process(self, pcm: bytes) -> bytes:
+        x = np.frombuffer(pcm[: len(pcm) - len(pcm) % 2], dtype="<i2").astype(np.float64)
+        if self._last is not None:
+            x = np.concatenate(([self._last], x))
+        if x.size == 0:
+            return b""
+        end = x.size - 1
+        n = math.floor((end - self._pos) / self.step) + 1 if end >= self._pos else 0
+        t = self._pos + np.arange(n) * self.step
+        y = np.interp(t, np.arange(x.size), x)
+        self._pos += n * self.step - end
+        self._last = float(x[-1])
+        return np.clip(np.round(y), -32768, 32767).astype("<i2").tobytes()
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +437,7 @@ class AsrBackend(abc.ABC):
     """Speech recognition backend."""
 
     needs_microphone = True     # False = the backend produces text by itself
+    streaming = False           # True = a StreamingAsrBackend (audio sent while speaking)
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -568,9 +617,456 @@ class KeyboardAsr(AsrBackend):
         return "keyboard (type a line + Enter)"
 
 
+# ----- OpenAI Realtime API (one WebSocket for the whole run) -----
+
+class RealtimeError(Exception):
+    """The Realtime API refused the session configuration."""
+
+
+def resolve_future(fut: concurrent.futures.Future, result=None,
+                   error: BaseException | None = None) -> None:
+    """Complete a future unless it is already done (e.g. cancelled after a timeout)."""
+    with contextlib.suppress(concurrent.futures.InvalidStateError):
+        if fut.done():
+            return
+        if error is not None:
+            fut.set_exception(error)
+        else:
+            fut.set_result(result)
+
+
+def realtime_error_text(event: dict) -> str:
+    err = event.get("error") or {}
+    if isinstance(err, dict):
+        return err.get("message") or err.get("code") or json.dumps(err)
+    return str(err)
+
+
+class RealtimeSession:
+    """An OpenAI Realtime WebSocket kept open for the whole run, on its own thread.
+
+    Connects at start(), sends `session` as session.update on every connect,
+    reconnects with backoff, and renews the connection before the server's
+    60-minute limit at a moment the owner reports as idle. The owner's
+    callbacks (on_event / on_open / on_close) and everything passed to call()
+    run on this thread, so the owner's state needs no locks; send() may only
+    be used there.
+    """
+
+    def __init__(self, tag: str, url: str, key: str, session: dict,
+                 on_event: Callable[[dict], None], on_open: Callable[[], None] | None = None,
+                 on_close: Callable[[BaseException | None], None] | None = None,
+                 is_idle: Callable[[], bool] = lambda: True, label: str = "") -> None:
+        self.tag, self.url, self.key, self.session = tag, url, key, session
+        self.label = label
+        self._announce = True              # log the next successful connect at info level
+        self.on_event, self.on_open, self.on_close, self.is_idle = (
+            on_event, on_open, on_close, is_idle)
+        self.loop = asyncio.new_event_loop()
+        self.connected = threading.Event()
+        self.fatal: str | None = None      # set when retrying cannot help (key rejected)
+        self._q: asyncio.Queue | None = None
+        self._ws = None
+        self._expires = 0.0                # time.time() by which the session must be renewed
+        self._renewing = False
+        self._opened = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._thread_main,
+                                            name=f"realtime-{self.tag}", daemon=True)
+            self._thread.start()
+
+    def call(self, fn: Callable, *args) -> None:
+        """Run fn(*args) on the session thread (thread-safe, does not wait)."""
+        with contextlib.suppress(RuntimeError):         # loop closed at exit
+            self.loop.call_soon_threadsafe(fn, *args)
+
+    def send(self, event: dict) -> bool:
+        """Queue an event on the current connection (session thread only)."""
+        if self._q is None:
+            return False
+        self._q.put_nowait(json.dumps(event))
+        return True
+
+    def wait_connected(self, timeout: float) -> bool:
+        return self.connected.wait(timeout)
+
+    def _thread_main(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        with contextlib.suppress(Exception):
+            self.loop.run_until_complete(self._run())
+
+    async def _run(self) -> None:
+        delay, quiet = 1.0, False
+        while True:
+            err: BaseException | None = None
+            self._opened = False
+            try:
+                await self._connect_once()
+            except websockets.InvalidStatus as e:
+                code = e.response.status_code
+                if code in (401, 403):
+                    self.fatal = f"the OpenAI API rejected the key ({code})"
+                    log.error("[%s] %s: %s", self.tag, self.fatal, KEY_HINT)
+                    if self.on_close:
+                        self.on_close(RuntimeError(self.fatal))
+                    return
+                err = e
+            except (OSError, websockets.WebSocketException, asyncio.TimeoutError,
+                    RealtimeError, ValueError) as e:
+                err = e
+            if self._renewing:
+                self._renewing = False
+                continue                      # planned: reconnect at once, quietly
+            if self._opened:                  # a working connection was lost
+                delay, quiet = 1.0, False
+            if isinstance(err, RealtimeError):
+                log.error("[%s] OpenAI refused the session: %s", self.tag, err)
+            elif not quiet:
+                log.info("[%s] OpenAI realtime connection %s (%s); retrying", self.tag,
+                         "lost" if self._opened else "failed", err or type(err).__name__)
+                quiet, self._announce = True, True
+            else:
+                log.debug("[%s] connect failed: %s", self.tag, err)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, REALTIME_BACKOFF_MAX_S)
+
+    async def _connect_once(self) -> None:
+        ws = await websockets.connect(
+            self.url, additional_headers={"Authorization": f"Bearer {self.key}"},
+            open_timeout=REALTIME_OPEN_TIMEOUT_S, max_size=None)
+        close_reason: BaseException | None = None
+        try:
+            await ws.send(json.dumps({"type": "session.update", "session": self.session}))
+            await asyncio.wait_for(self._await_updated(ws), REALTIME_OPEN_TIMEOUT_S)
+            self._ws, self._q = ws, asyncio.Queue()
+            self._opened = True
+            self.connected.set()
+            log.log(logging.INFO if self._announce else logging.DEBUG,
+                    "[%s] OpenAI realtime session ready (%s)", self.tag, self.label or self.url)
+            self._announce = False
+            if self.on_open:
+                self.on_open()
+            sender = asyncio.ensure_future(self._sender(ws, self._q))
+            renewer = asyncio.ensure_future(self._renewer(ws))
+            try:
+                async for msg in ws:
+                    if isinstance(msg, str):
+                        self._dispatch(msg)
+            except websockets.ConnectionClosed as e:
+                close_reason = e
+            finally:
+                sender.cancel()
+                renewer.cancel()
+            if close_reason is None and not self._renewing:
+                close_reason = ConnectionError("closed by the server")
+        finally:
+            was_open = self._q is not None
+            self.connected.clear()
+            self._ws, self._q = None, None
+            await ws.close()
+            if was_open and self.on_close:
+                self.on_close(close_reason or ConnectionError("connection closed"))
+        if close_reason is not None:
+            raise ConnectionError(str(close_reason) or type(close_reason).__name__)
+
+    async def _await_updated(self, ws) -> None:
+        self._expires = time.time() + REALTIME_MAX_AGE_S
+        while True:
+            ev = json.loads(await ws.recv())
+            etype = ev.get("type")
+            if etype in ("session.created", "transcription_session.created"):
+                exp = float((ev.get("session") or {}).get("expires_at") or 0)
+                if exp:
+                    self._expires = min(self._expires, exp - (60 * 60 - REALTIME_MAX_AGE_S))
+            elif etype in ("session.updated", "transcription_session.updated"):
+                return
+            elif etype == "error":
+                raise RealtimeError(realtime_error_text(ev))
+
+    def _dispatch(self, msg: str) -> None:
+        try:
+            ev = json.loads(msg)
+        except ValueError:
+            return
+        try:
+            self.on_event(ev)
+        except Exception:
+            log.exception("[%s] error while handling %s", self.tag, ev.get("type"))
+
+    @staticmethod
+    async def _sender(ws, q: asyncio.Queue) -> None:
+        while True:
+            msg = await q.get()
+            await ws.send(msg)
+
+    async def _renewer(self, ws) -> None:
+        while True:
+            await asyncio.sleep(REALTIME_RENEW_CHECK_S)
+            if time.time() >= self._expires and self.is_idle():
+                log.debug("[%s] renewing the realtime session before its time limit", self.tag)
+                self._renewing = True
+                await ws.close()
+                return
+
+
+@dataclass
+class LiveTurn:
+    chunks: list[str] = field(default_factory=list)   # base64 PCM as sent (for a resend)
+    future: concurrent.futures.Future | None = None
+    event_id: str = ""
+    item_id: str = ""
+    partial: str = ""
+
+
+class LiveTurns:
+    """Bookkeeping of a Realtime transcription session (pure, unit-tested).
+
+    Audio is appended to the open turn; commit() closes it and the server
+    answers input_audio_buffer.committed (in commit order) with the item id,
+    then ...transcription.completed for that item, possibly out of order
+    across turns. A commit the server rejects comes back as an error carrying
+    the commit's event_id. After a reconnect the server has forgotten
+    everything, so the unfinished turns are sent again (resend()).
+    """
+
+    def __init__(self) -> None:
+        self.open: LiveTurn | None = None
+        self.committed: list[LiveTurn] = []     # waiting for a transcript, in commit order
+        self._by_item: dict[str, LiveTurn] = {}
+        self._early: dict[str, str] = {}        # transcripts that beat their committed event
+        self._last_item = ""
+        self._n = 0
+
+    def idle(self) -> bool:
+        return self.open is None and not self.committed
+
+    def append(self, b64: str) -> bool:
+        """Add audio to the open turn; True when this starts a new turn."""
+        new = self.open is None
+        if new:
+            self.open = LiveTurn()
+        self.open.chunks.append(b64)
+        return new
+
+    def commit(self, fut: concurrent.futures.Future) -> LiveTurn | None:
+        """Close the open turn; None (and an empty result) when it has no audio."""
+        t, self.open = self.open, None
+        if t is None or not t.chunks:
+            resolve_future(fut, "")
+            return None
+        self._n += 1
+        t.event_id, t.future = f"commit_{self._n}", fut
+        self.committed.append(t)
+        return t
+
+    def clear(self) -> None:
+        self.open = None
+
+    def _finish(self, t: LiveTurn, text: str | None = None,
+                error: BaseException | None = None) -> None:
+        with contextlib.suppress(ValueError):
+            self.committed.remove(t)
+        if t.item_id:
+            self._by_item.pop(t.item_id, None)
+        resolve_future(t.future, text, error)
+
+    def on_committed(self, item_id: str, previous_item_id: str | None = None) -> LiveTurn | None:
+        if previous_item_id and self._last_item and previous_item_id != self._last_item:
+            log.debug("[asr] committed item %s follows %s, not %s", item_id, previous_item_id,
+                      self._last_item)
+        self._last_item = item_id
+        t = next((t for t in self.committed if not t.item_id), None)
+        if t is None:
+            return None
+        t.item_id = item_id
+        self._by_item[item_id] = t
+        if item_id in self._early:
+            self._finish(t, self._early.pop(item_id))
+        return t
+
+    def on_delta(self, item_id: str, delta: str) -> LiveTurn | None:
+        t = self._by_item.get(item_id)
+        if t is not None:
+            t.partial += delta
+        return t
+
+    def on_completed(self, item_id: str, transcript: str) -> LiveTurn | None:
+        t = self._by_item.get(item_id)
+        if t is None:
+            if len(self._early) < 16:
+                self._early[item_id] = transcript
+            return None
+        self._finish(t, transcript)
+        return t
+
+    def on_failed(self, item_id: str, message: str) -> LiveTurn | None:
+        t = self._by_item.get(item_id)
+        if t is not None:
+            self._finish(t, error=RuntimeError(message))
+        return t
+
+    def on_error(self, event_id: str, message: str) -> LiveTurn | None:
+        t = next((t for t in self.committed if event_id and t.event_id == event_id), None)
+        if t is not None:
+            self._finish(t, error=RuntimeError(message))
+        return t
+
+    def resend(self) -> list[tuple[list[str], LiveTurn | None]]:
+        """What to send after a reconnect: (chunks, turn to commit or None for the open one)."""
+        self.committed = [t for t in self.committed if not t.future.done()]
+        self._by_item.clear()
+        self._early.clear()
+        self._last_item = ""
+        for t in self.committed:
+            t.item_id, t.partial = "", ""
+        out: list[tuple[list[str], LiveTurn | None]] = [(t.chunks, t) for t in self.committed]
+        if self.open is not None:
+            out.append((self.open.chunks, None))
+        return out
+
+
+class StreamingAsrBackend(AsrBackend):
+    """A recognizer that receives the audio while the user is still speaking.
+
+    append() / commit() / clear() are thread-safe and return at once; the
+    microphone side decides what is sent (VadStreamer: never silence).
+    """
+
+    streaming = True
+
+    @abc.abstractmethod
+    def append(self, pcm: bytes) -> None:
+        """Add 16 kHz mono PCM16LE to the current turn."""
+
+    @abc.abstractmethod
+    def commit(self) -> concurrent.futures.Future:
+        """End the turn; the future resolves to its text."""
+
+    @abc.abstractmethod
+    def clear(self) -> None:
+        """Discard the current turn."""
+
+    def transcribe(self, wav: bytes, lang: str | None) -> str:
+        """Whole-file use (tests, tools): append it all and commit."""
+        with wave.open(io.BytesIO(wav), "rb") as w:
+            pcm = w.readframes(w.getnframes())
+        step = MIC_RATE * MIC_FRAME_MS // 1000 * 2
+        for i in range(0, len(pcm), step):
+            self.append(pcm[i:i + step])
+        return self.commit().result(timeout=LIVE_COMMIT_TIMEOUT_S)
+
+
+class OpenAILiveAsr(StreamingAsrBackend):
+    """OpenAI Realtime transcription (gpt-live-transcribe) over one WebSocket.
+
+    Transcription runs while the user speaks, so the text is ready shortly
+    after the end of speech. The local VAD decides what is sent and when the
+    turn ends (the model has no server-side VAD); OpenAI bills the minutes of
+    audio sent.
+    """
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        super().__init__(args)
+        self.model = getattr(args, "asr_model", None) or DEFAULT_LIVE_ASR_MODEL
+        lang = None if getattr(args, "lang", "auto") == "auto" else args.lang
+        session = {"type": "transcription", "audio": {"input": {
+            "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
+            "transcription": {"model": self.model, **language_field(self.model, lang)},
+            "turn_detection": None}}}
+        self.turns = LiveTurns()
+        self.audio_bytes_sent = 0          # 24 kHz PCM bytes that went to OpenAI
+        self._resampler = LinearResampler(MIC_RATE, REALTIME_RATE)
+        self.rt = RealtimeSession("asr", f"{OPENAI_REALTIME_URL}?intent=transcription",
+                                  args.openai_key, session, self._on_event,
+                                  on_open=self._on_open, on_close=self._on_close,
+                                  is_idle=self.turns.idle, label=self.model)
+
+    def start(self) -> None:
+        self.rt.start()
+
+    def describe(self) -> str:
+        return f"openai-live ({self.model}, lang {self.args.lang}, realtime)"
+
+    # thread-safe entry points
+    def append(self, pcm: bytes) -> None:
+        self.rt.call(self._append, pcm)
+
+    def commit(self) -> concurrent.futures.Future:
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        if self.rt.fatal:
+            resolve_future(fut, error=RuntimeError(self.rt.fatal))
+        else:
+            self.rt.call(self._commit, fut)
+        return fut
+
+    def clear(self) -> None:
+        self.rt.call(self._clear)
+
+    # session thread
+    def _send_audio(self, b64: str) -> None:
+        if self.rt.send({"type": "input_audio_buffer.append", "audio": b64}):
+            self.audio_bytes_sent += len(b64) * 3 // 4 - b64.count("=", -2)
+
+    def _append(self, pcm: bytes) -> None:
+        if self.turns.open is None:
+            self._resampler.reset()
+        data = self._resampler.process(pcm)
+        if not data:
+            return
+        b64 = base64.b64encode(data).decode("ascii")
+        self.turns.append(b64)
+        self._send_audio(b64)
+
+    def _commit(self, fut: concurrent.futures.Future) -> None:
+        t = self.turns.commit(fut)
+        if t is not None:
+            self.rt.send({"type": "input_audio_buffer.commit", "event_id": t.event_id})
+
+    def _clear(self) -> None:
+        if self.turns.open is not None:
+            self.turns.clear()
+            self.rt.send({"type": "input_audio_buffer.clear"})
+
+    def _on_open(self) -> None:
+        resend = self.turns.resend()
+        if resend:
+            log.info("[asr] re-sending %d unfinished turn(s) after reconnecting", len(resend))
+        for chunks, t in resend:
+            for b64 in chunks:
+                self._send_audio(b64)
+            if t is not None:
+                self.rt.send({"type": "input_audio_buffer.commit", "event_id": t.event_id})
+
+    def _on_close(self, reason: BaseException | None) -> None:
+        if self.rt.fatal:
+            for t in list(self.turns.committed):
+                self.turns._finish(t, error=RuntimeError(self.rt.fatal))
+
+    def _on_event(self, ev: dict) -> None:
+        etype = ev.get("type", "")
+        if etype == "input_audio_buffer.committed":
+            self.turns.on_committed(ev.get("item_id", ""), ev.get("previous_item_id"))
+        elif etype == "conversation.item.input_audio_transcription.delta":
+            t = self.turns.on_delta(ev.get("item_id", ""), ev.get("delta", ""))
+            if t is not None and log.isEnabledFor(logging.DEBUG):
+                log.debug("[asr] … %s", t.partial)
+        elif etype == "conversation.item.input_audio_transcription.completed":
+            self.turns.on_completed(ev.get("item_id", ""), ev.get("transcript", ""))
+        elif etype == "conversation.item.input_audio_transcription.failed":
+            self.turns.on_failed(ev.get("item_id", ""), realtime_error_text(ev))
+        elif etype == "error":
+            event_id = (ev.get("error") or {}).get("event_id") or ""     # the client event's id
+            if self.turns.on_error(event_id, realtime_error_text(ev)) is None:
+                log.warning("[asr] OpenAI realtime error: %s", realtime_error_text(ev))
+
+
 # Registries: add a backend by writing a class and listing it here.
 TTS_BACKENDS: dict[str, type[TtsBackend]] = {"openai": OpenAITts, "tone": ToneTts}
-ASR_BACKENDS: dict[str, type[AsrBackend]] = {"openai": OpenAIAsr, "keyboard": KeyboardAsr}
+ASR_BACKENDS: dict[str, type[AsrBackend]] = {"openai": OpenAIAsr, "openai-live": OpenAILiveAsr,
+                                             "keyboard": KeyboardAsr}
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +1125,21 @@ class EnergyVad:
     @property
     def in_segment(self) -> bool:
         return self.state == "speech"
+
+    @property
+    def segment(self) -> list[bytes]:
+        """Frames of the current segment so far (pre-roll included); read-only."""
+        return self._seg
+
+    @property
+    def voiced_frames(self) -> int:
+        """Onset to the last speech frame of the current segment, in frames."""
+        return self._last_speech - self._onset_index
+
+    @property
+    def last_speech_index(self) -> int:
+        """Index in `segment` just past the last speech frame."""
+        return self._last_speech
 
     def _to_idle(self) -> None:
         self.state = "idle"
@@ -690,6 +1201,76 @@ class EnergyVad:
         if self._silence >= self.silence_frames:
             return [self._finish("silence")]
         return []
+
+
+@dataclass
+class StreamAction:
+    kind: str                   # "start" | "append" | "commit" | "clear" | "drop"
+    audio: bytes = b""          # "append": frames to send
+    seconds: float = 0.0        # "commit": length of the committed turn
+    reason: str = ""            # "drop": the VAD's cancel reason
+
+
+class VadStreamer:
+    """Turns EnergyVad decisions into append / commit / clear for a streaming recognizer.
+
+    Sends exactly the audio the REST backend would upload for the same segment
+    (pre-roll, speech, pauses inside it, and the short tail after the last
+    speech frame), but while the user is still speaking:
+
+    - nothing is sent until the segment has `min_speech` of voiced audio, so
+      the clicks and coughs that the VAD drops as too short never leave the
+      machine;
+    - after that, frames go out as they arrive, except that silence longer
+      than the tail is held back: it is sent only if speech resumes (a pause
+      inside the utterance) and discarded when the utterance ends;
+    - the end of the utterance is a commit; a segment aborted by the
+      half-duplex gate after audio went out is a clear.
+
+    Silence outside a segment is never sent.
+    """
+
+    def __init__(self, vad: EnergyVad) -> None:
+        self.vad = vad
+        self.bytes_appended = 0          # total handed to the recognizer (for tests and logs)
+        self._reset()
+
+    def _reset(self) -> None:
+        self._sent_frames = 0
+        self._sent_bytes = 0
+        self._streaming = False
+
+    def _append(self, out: list[StreamAction], data: bytes) -> None:
+        if data:
+            out.append(StreamAction("append", audio=data))
+            self._sent_bytes += len(data)
+            self.bytes_appended += len(data)
+
+    def process(self, frame: bytes, gated: bool = False) -> list[StreamAction]:
+        out: list[StreamAction] = []
+        for ev in self.vad.process(frame, gated=gated):
+            if ev.kind == "start":
+                self._reset()
+                out.append(StreamAction("start"))
+            elif ev.kind == "end":
+                self._append(out, ev.audio[self._sent_bytes:])
+                out.append(StreamAction("commit", seconds=len(ev.audio) / 2 / MIC_RATE))
+                self._reset()
+            else:
+                if self._sent_bytes:
+                    out.append(StreamAction("clear"))
+                out.append(StreamAction("drop", reason=ev.reason))
+                self._reset()
+        vad = self.vad
+        if vad.in_segment:
+            if not self._streaming and vad.voiced_frames >= vad.min_speech_frames:
+                self._streaming = True
+            if self._streaming:
+                upto = min(len(vad.segment), vad.last_speech_index + vad.tail_frames)
+                if upto > self._sent_frames:
+                    self._append(out, b"".join(vad.segment[self._sent_frames:upto]))
+                    self._sent_frames = upto
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -1242,6 +1823,7 @@ class MicListener:
         self.lang = None if args.lang == "auto" else args.lang
         self.frames: queue.Queue[bytes] = queue.Queue(maxsize=1000)
         self.worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.streamer: VadStreamer | None = None
         self._ptt_toggle = threading.Event()
 
     def start(self) -> None:
@@ -1311,17 +1893,33 @@ class MicListener:
 
     def _vad_loop(self) -> None:
         vad = EnergyVad(threshold_dbfs=self.args.vad_threshold, silence_ms=self.args.silence_ms)
+        streamer = VadStreamer(vad) if self.asr.streaming else None
+        self.streamer = streamer
         announced = False
         while True:
             frame = self.frames.get()
-            for ev in vad.process(frame, gated=self._gated()):
-                if ev.kind == "start":
-                    log.debug("[asr] speech started")
-                    self._speech_started()
-                elif ev.kind == "end":
-                    self.worker.submit(self._transcribe, ev.audio)
-                else:
-                    log.debug("[asr] segment dropped (%s)", ev.reason)
+            if streamer is not None:
+                for a in streamer.process(frame, gated=self._gated()):
+                    if a.kind == "start":
+                        log.debug("[asr] speech started")
+                        self._speech_started()
+                    elif a.kind == "append":
+                        self.asr.append(a.audio)
+                    elif a.kind == "commit":
+                        self._commit(a.seconds)
+                    elif a.kind == "clear":
+                        self.asr.clear()
+                    else:
+                        log.debug("[asr] segment dropped (%s)", a.reason)
+            else:
+                for ev in vad.process(frame, gated=self._gated()):
+                    if ev.kind == "start":
+                        log.debug("[asr] speech started")
+                        self._speech_started()
+                    elif ev.kind == "end":
+                        self.worker.submit(self._transcribe, ev.audio)
+                    else:
+                        log.debug("[asr] segment dropped (%s)", ev.reason)
             if not announced and vad.state == "idle":
                 announced = True
                 log.info("[asr] speech threshold %.0f dBFS (noise floor %s)", vad.threshold_dbfs,
@@ -1329,7 +1927,9 @@ class MicListener:
 
     def _ptt_loop(self) -> None:
         threading.Thread(target=self._ptt_keys, name="ptt", daemon=True).start()
-        recording, buf = False, bytearray()
+        min_bytes, max_bytes = MIC_RATE * 2 * 3 // 10, MIC_RATE * 2 * 20       # 300 ms, 20 s
+        streaming = self.asr.streaming
+        recording, buf, sent = False, bytearray(), 0
         while True:
             frame = self.frames.get()
             if self._ptt_toggle.is_set():
@@ -1337,17 +1937,30 @@ class MicListener:
                 recording = not recording
                 if recording:
                     buf.clear()
+                    sent = 0
                     self._speech_started()
                     print("[asr] recording... press Enter to stop", flush=True)
                 else:
-                    if len(buf) >= MIC_RATE * 2 * 3 // 10:                  # >= 300 ms
-                        self.worker.submit(self._transcribe, bytes(buf))
+                    if sent + len(buf) >= min_bytes:
+                        if streaming:
+                            self.asr.append(bytes(buf))
+                            self._commit((sent + len(buf)) / 2 / MIC_RATE)
+                        else:
+                            self.worker.submit(self._transcribe, bytes(buf))
                     else:
                         log.info("[asr] too short, ignored")
                     print("[asr] press Enter to talk", flush=True)
             if recording and not self._gated():
                 buf.extend(frame)
-                if len(buf) >= MIC_RATE * 2 * 20:                           # 20 s cut
+                if streaming and sent + len(buf) >= min_bytes:
+                    # stream once it is long enough to keep (a tap of Enter sends nothing)
+                    self.asr.append(bytes(buf))
+                    sent += len(buf)
+                    buf.clear()
+                    if sent >= max_bytes:
+                        self._commit(sent / 2 / MIC_RATE)
+                        sent = 0
+                elif not streaming and len(buf) >= max_bytes:
                     self.worker.submit(self._transcribe, bytes(buf))
                     buf.clear()
 
@@ -1359,18 +1972,43 @@ class MicListener:
     def _transcribe(self, pcm: bytes) -> None:
         t0 = time.monotonic()
         try:
-            text = sanitize_recog_text(self.asr.transcribe(pcm_to_wav(pcm), self.lang))
+            text = self.asr.transcribe(pcm_to_wav(pcm), self.lang)
         except Exception as e:
-            if is_key_error(e):
-                log.error("[asr] the OpenAI API rejected the key: %s", KEY_HINT)
-            else:
-                log.error("[asr] transcription failed: %s: %s", type(e).__name__, e)
+            self._failed(e)
             return
+        self._deliver(text, len(pcm) / 2 / MIC_RATE, time.monotonic() - t0)
+
+    def _commit(self, seconds: float) -> None:
+        """End a streamed turn; the single worker delivers results in commit order."""
+        fut = self.asr.commit()
+        self.worker.submit(self._await_commit, fut, seconds, time.monotonic())
+
+    def _await_commit(self, fut: concurrent.futures.Future, seconds: float, t0: float) -> None:
+        try:
+            text = fut.result(timeout=max(t0 + LIVE_COMMIT_TIMEOUT_S - time.monotonic(), 0.1))
+        except concurrent.futures.TimeoutError:
+            fut.cancel()
+            log.error("[asr] no transcript within %.0f s; utterance dropped", LIVE_COMMIT_TIMEOUT_S)
+            return
+        except Exception as e:
+            self._failed(e)
+            return
+        self._deliver(text, seconds, time.monotonic() - t0)
+
+    @staticmethod
+    def _failed(e: BaseException) -> None:
+        if is_key_error(e):
+            log.error("[asr] the OpenAI API rejected the key: %s", KEY_HINT)
+        else:
+            log.error("[asr] transcription failed: %s: %s", type(e).__name__, e)
+
+    def _deliver(self, raw: str, seconds: float, elapsed: float) -> None:
+        text = sanitize_recog_text(raw)
         if not text:
             log.debug("[asr] (nothing recognized)")
             return
-        log.info("[asr] %s  (%.1f s audio, %.1f s)", text, len(pcm) / 2 / MIC_RATE,
-                 time.monotonic() - t0)
+        log.info("[asr] %s  (%.1f s audio, %.2f s%s)", text, seconds, elapsed,
+                 " after the end of speech" if self.asr.streaming else "")
         self.bridge.emit_threadsafe("RECOG_EVENT_STOP", text)
 
 
@@ -1416,7 +2054,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="audio collected before an utterance starts playing, against dropouts "
                         f"(default {DEFAULT_PREBUFFER_MS}; 0 = off)")
     g.add_argument("--tts-model", default=None, help=f"default {DEFAULT_TTS_MODEL}")
-    g.add_argument("--asr-model", default=None, help=f"default {DEFAULT_ASR_MODEL}")
+    g.add_argument("--asr-model", default=None,
+                   help=f"default {DEFAULT_ASR_MODEL} (openai), {DEFAULT_LIVE_ASR_MODEL} (openai-live)")
     g.add_argument("--openai-key", default=os.environ.get("OPENAI_API_KEY") or None,
                    help="OpenAI API key (env OPENAI_API_KEY, or a .env file)")
     g = p.add_argument_group("microphone")
@@ -1484,7 +2123,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--ptt and --asr keyboard both read the terminal; use only one")
         if args.tts == "none" and args.asr == "none":
             parser.error("both --tts and --asr are 'none'; nothing to do")
-        if "openai" in (args.tts, args.asr) and not args.openai_key:
+        if any(b.startswith("openai") for b in (args.tts, args.asr)) and not args.openai_key:
             raise FatalError(f"no OpenAI API key: {KEY_HINT}")
         tts = TTS_BACKENDS[args.tts](args) if args.tts != "none" else None
         asr = ASR_BACKENDS[args.asr](args) if args.asr != "none" else None
