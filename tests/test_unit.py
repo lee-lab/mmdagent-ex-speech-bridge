@@ -258,6 +258,12 @@ def keep_signal_handlers(monkeypatch):
     monkeypatch.setattr(sb.signal, "signal", lambda *a: None)
 
 
+@pytest.fixture(autouse=True)
+def no_dotenv(monkeypatch):
+    """main() reads .env files; a developer's real .env must not leak into the tests."""
+    monkeypatch.setattr(sb, "dotenv_paths", list)
+
+
 def test_cli_ptt_with_keyboard_is_an_error():
     with pytest.raises(SystemExit) as e:
         sb.main(["--asr", "keyboard", "--ptt", "--tts", "tone"])
@@ -580,3 +586,63 @@ def test_utterance_records_prebuffer(monkeypatch):
 
     bridge, _ = asyncio.run(run_flow(flow))
     assert [c[0] for c in bridge.ws.commands()] == ["SYNTH_EVENT_START", "SYNTH_EVENT_STOP"]
+
+
+# ----- .env files -----
+
+def test_parse_dotenv():
+    text = ("﻿# comment\n"
+            "OPENAI_API_KEY=sk-plain\n"
+            "export MMDAGENT_HOST = 192.168.0.5   # trailing comment\n"
+            "MMDAGENT_API_KEY=\"quoted # not a comment\"  # comment\n"
+            "SINGLE='a b'\n"
+            "EMPTY=\n"
+            "HASH=abc#def\n"
+            "not a line\n"
+            "1BAD=x\n")
+    assert sb.parse_dotenv(text) == {
+        "OPENAI_API_KEY": "sk-plain", "MMDAGENT_HOST": "192.168.0.5",
+        "MMDAGENT_API_KEY": "quoted # not a comment", "SINGLE": "a b", "EMPTY": "",
+        "HASH": "abc#def"}
+
+
+def test_parse_dotenv_crlf():
+    assert sb.parse_dotenv("A=1\r\nB=\"2\"\r\n") == {"A": "1", "B": "2"}
+
+
+def test_load_dotenv_environment_wins_and_first_file_wins(tmp_path):
+    first, second = tmp_path / "a.env", tmp_path / "b.env"
+    first.write_text("OPENAI_API_KEY=from-first\nOTHER=x\n", encoding="utf-8")
+    second.write_text("OPENAI_API_KEY=from-second\nMMDAGENT_HOST=h2\nMMDAGENT_API_KEY=k2\n",
+                      encoding="utf-8")
+    env = {"MMDAGENT_API_KEY": "already-set"}
+    taken = sb.load_dotenv([str(tmp_path / "missing.env"), str(first), str(second)], env)
+    assert env == {"OPENAI_API_KEY": "from-first", "MMDAGENT_HOST": "h2",
+                   "MMDAGENT_API_KEY": "already-set"}           # OTHER is not ours
+    assert taken == [("OPENAI_API_KEY", str(first)), ("MMDAGENT_HOST", str(second))]
+
+
+def test_load_dotenv_empty_environment_value_is_missing(tmp_path):
+    f = tmp_path / ".env"
+    f.write_text("OPENAI_API_KEY=k\n", encoding="utf-8")
+    env = {"OPENAI_API_KEY": ""}
+    sb.load_dotenv([str(f)], env)
+    assert env["OPENAI_API_KEY"] == "k"
+
+
+def test_main_reads_key_from_dotenv_without_logging_it(tmp_path, monkeypatch, caplog):
+    f = tmp_path / ".env"
+    f.write_text("OPENAI_API_KEY=sk-secret-value\n", encoding="utf-8")
+    monkeypatch.setenv("OPENAI_API_KEY", "")          # restored (or removed) at teardown
+    monkeypatch.setattr(sb, "dotenv_paths", lambda: [str(f)])
+    seen = {}
+
+    def fake_build_parser():
+        seen["key"] = sb.os.environ.get("OPENAI_API_KEY")
+        raise SystemExit(0)
+
+    monkeypatch.setattr(sb, "build_parser", fake_build_parser)
+    with pytest.raises(SystemExit):
+        sb.main([])
+    assert seen["key"] == "sk-secret-value"
+    assert "sk-secret-value" not in caplog.text

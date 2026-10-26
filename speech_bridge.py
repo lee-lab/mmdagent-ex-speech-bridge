@@ -95,8 +95,11 @@ OPENAI_VOICES = ("alloy", "ash", "ballad", "cedar", "coral", "echo", "fable",
                  "marin", "nova", "onyx", "sage", "shimmer", "verse")
 DEFAULT_VOICE = "marin"
 
-KEY_HINT = ("set OPENAI_API_KEY (or pass --openai-key), or try the offline backends: "
-            "--tts tone --asr keyboard")
+KEY_HINT = ("set OPENAI_API_KEY (in the environment or in a .env file), or pass --openai-key, "
+            "or try the offline backends: --tts tone --asr keyboard")
+
+# Settings that may come from a .env file when the environment does not have them
+DOTENV_KEYS = ("OPENAI_API_KEY", "MMDAGENT_API_KEY", "MMDAGENT_HOST")
 
 
 class FatalError(Exception):
@@ -267,6 +270,71 @@ def select_replays(events: Iterable[dict], cutoff_ms: float = 0.0,
 
 def short(text: str, n: int = 40) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
+
+
+# ---------------------------------------------------------------------------
+# .env files (pure parser, unit-tested)
+# ---------------------------------------------------------------------------
+
+_DOTENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_DOTENV_QUOTED = re.compile(r"""(["'])(.*?)\1\s*(?:#.*)?""")
+
+
+def parse_dotenv(text: str) -> dict[str, str]:
+    """Read KEY=value lines: '#' comments, optional 'export ', optional quotes.
+
+    No variable expansion and no multi-line values. Malformed lines are skipped.
+    """
+    out: dict[str, str] = {}
+    for raw in text.lstrip("﻿").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not _DOTENV_KEY.fullmatch(key):
+            continue
+        m = _DOTENV_QUOTED.fullmatch(value)
+        if m:
+            value = m.group(2)
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+        out[key] = value
+    return out
+
+
+def dotenv_paths() -> list[str]:
+    """Where .env files are read from: the current directory, then the script's directory."""
+    paths: list[str] = []
+    for d in (os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
+        p = os.path.join(d, ".env")
+        if all(os.path.normcase(os.path.realpath(p)) != os.path.normcase(os.path.realpath(q))
+               for q in paths):
+            paths.append(p)
+    return paths
+
+
+def load_dotenv(paths: Iterable[str], environ, keys: Sequence[str] = DOTENV_KEYS
+                ) -> list[tuple[str, str]]:
+    """Fill the `keys` that `environ` lacks (or has empty) from .env files.
+
+    The environment always wins; among the files the first one that sets a key
+    wins. Returns the (key, path) pairs taken, never the values.
+    """
+    taken: list[tuple[str, str]] = []
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                values = parse_dotenv(f.read())
+        except (OSError, UnicodeDecodeError):
+            continue
+        for k in keys:
+            if values.get(k) and not environ.get(k):
+                environ[k] = values[k]
+                taken.append((k, path))
+    return taken
 
 
 # ---------------------------------------------------------------------------
@@ -1207,13 +1275,13 @@ def build_parser() -> argparse.ArgumentParser:
                     "(via Plugin_API).")
     g = p.add_argument_group("engine")
     g.add_argument("--host", default=os.environ.get("MMDAGENT_HOST", "localhost"),
-                   help="engine host (env MMDAGENT_HOST; default localhost)")
+                   help="engine host (env MMDAGENT_HOST or .env; default localhost)")
     g.add_argument("--rest-port", type=int, default=DEFAULT_REST_PORT,
                    help="Plugin_API REST port (default 48000)")
     g.add_argument("--ws-port", type=int, default=None,
                    help="Plugin_API WebSocket port (default REST port + 1)")
     g.add_argument("--mmdagent-key", default=os.environ.get("MMDAGENT_API_KEY") or None,
-                   help="engine Plugin_API_Key, if set (env MMDAGENT_API_KEY)")
+                   help="engine Plugin_API_Key, if set (env MMDAGENT_API_KEY or .env)")
     g = p.add_argument_group("backends")
     g.add_argument("--tts", choices=[*TTS_BACKENDS, "none"], default="openai",
                    help="speech synthesis backend (default openai)")
@@ -1231,7 +1299,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--asr-model", default="gpt-4o-mini-transcribe",
                    help="default gpt-4o-mini-transcribe")
     g.add_argument("--openai-key", default=os.environ.get("OPENAI_API_KEY") or None,
-                   help="OpenAI API key (env OPENAI_API_KEY)")
+                   help="OpenAI API key (env OPENAI_API_KEY, or a .env file)")
     g = p.add_argument_group("microphone")
     g.add_argument("--mic", default=None, help="input device index or name substring")
     g.add_argument("--list-mics", action="store_true", help="list input devices and exit")
@@ -1279,6 +1347,7 @@ def main(argv: list[str] | None = None) -> int:
             s.reconfigure(errors="replace")
     with contextlib.suppress(ValueError, OSError, AttributeError):   # not in the main thread
         signal.signal(signal.SIGTERM, _sigterm)
+    from_dotenv = load_dotenv(dotenv_paths(), os.environ)    # before the defaults are read
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.ws_port is None:
@@ -1287,6 +1356,8 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     for noisy in ("asyncio", "websockets", "httpx", "httpx2", "httpcore", "openai"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    for key, path in from_dotenv:
+        log.info("[config] %s read from %s", key, path)
     try:
         if args.list_mics:
             return list_mics()
